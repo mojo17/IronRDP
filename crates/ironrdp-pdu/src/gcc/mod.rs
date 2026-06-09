@@ -149,7 +149,14 @@ impl<'de> Decode<'de> for ClientGccBlocks {
         let mut monitor_extended = None;
 
         loop {
-            let (ty, cur) = user_header_try!(UserDataHeader::decode(src));
+            let (raw_ty, cur) = user_header_try!(UserDataHeader::decode(src));
+            let Some(ty) = ClientGccType::from_u16(raw_ty) else {
+                // Forward-compat: skip GCC blocks we don't recognise. Newer clients
+                // (e.g. the Windows App / msrdc, which sends types 0xC00C/0xC00D)
+                // include block types not yet in MS-RDPBCGR; per spec these must be
+                // skipped, not rejected.
+                continue;
+            };
 
             match ty {
                 ClientGccType::CoreData => core = Some(decode(cur)?),
@@ -244,7 +251,10 @@ impl<'de> Decode<'de> for ServerGccBlocks {
         let mut multi_transport_channel = None;
 
         loop {
-            let (ty, cur) = user_header_try!(UserDataHeader::decode(src));
+            let (raw_ty, cur) = user_header_try!(UserDataHeader::decode(src));
+            let Some(ty) = ServerGccType::from_u16(raw_ty) else {
+                continue; // forward-compat: skip unknown server GCC blocks
+            };
 
             match ty {
                 ServerGccType::CoreData => core = Some(decode(cur)?),
@@ -331,14 +341,14 @@ impl UserDataHeader {
         Ok(())
     }
 
-    pub fn decode<'de, T>(src: &mut ReadCursor<'de>) -> DecodeResult<(T, &'de [u8])>
-    where
-        T: FromPrimitive,
-    {
+    /// Decodes a GCC user-data block header, returning the raw `blockType` and the
+    /// block body. Unknown block types are NOT rejected here — the caller maps the
+    /// raw type and SKIPS unrecognised blocks (MS-RDPBCGR forward-compat: newer
+    /// clients, e.g. the Windows App, include block types not yet specified).
+    pub fn decode<'de>(src: &mut ReadCursor<'de>) -> DecodeResult<(u16, &'de [u8])> {
         ensure_fixed_part_size!(in: src);
 
-        let block_type =
-            T::from_u16(src.read_u16()).ok_or_else(|| invalid_field_err!("blockType", "invalid GCC type"))?;
+        let block_type = src.read_u16();
         let block_length: usize = cast_length!("blockLen", src.read_u16())?;
 
         if block_length <= USER_DATA_HEADER_SIZE {

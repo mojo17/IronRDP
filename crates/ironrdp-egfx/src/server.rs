@@ -760,6 +760,24 @@ pub trait GraphicsPipelineHandler: Send {
     /// based on [`preferred_capabilities()`](Self::preferred_capabilities).
     fn capabilities_advertise(&mut self, pdu: &CapabilitiesAdvertisePdu);
 
+    /// Veto hook, called right after [`capabilities_advertise`](Self::capabilities_advertise)
+    /// and before the server confirms capabilities. Return `false` to decline
+    /// EGFX for this client: the server then skips `CapabilitiesConfirm` and
+    /// never becomes ready, so the client falls back to the legacy bitmap output
+    /// path instead of being committed to a graphics pipeline the server cannot
+    /// fill.
+    ///
+    /// Default `true` (proceed). Override to decline when the client's advertised
+    /// capabilities are incompatible with what the server can actually send —
+    /// e.g. the client advertised no AVC support but the server only fills EGFX
+    /// with H.264/AVC420. (Without this, a client that advertises EGFX-without-AVC
+    /// — notably the iPad Windows App — gets its caps confirmed, is committed to
+    /// the graphics pipeline, then receives legacy bitmaps it does not expect and
+    /// disconnects with a protocol error.)
+    fn should_activate(&self) -> bool {
+        true
+    }
+
     /// Called when the EGFX channel is ready to send frames
     ///
     /// At this point, capability negotiation is complete.
@@ -1633,6 +1651,20 @@ impl GraphicsPipelineServer {
 
     fn handle_capabilities_advertise(&mut self, pdu: CapabilitiesAdvertisePdu) {
         self.handler.capabilities_advertise(&pdu);
+
+        // Veto hook: if the handler declines (e.g. the client advertised no AVC
+        // but we only fill EGFX with H.264), skip CapabilitiesConfirm and stay in
+        // WaitingForCapabilities so the channel never becomes Ready. The client
+        // then falls back to the legacy bitmap output path. See
+        // `GraphicsPipelineHandler::should_activate`.
+        if !self.handler.should_activate() {
+            warn!(
+                "EGFX: handler declined activation (client caps incompatible with \
+                 server codecs); leaving channel un-negotiated, client falls back to legacy"
+            );
+            return;
+        }
+
         let server_caps = self.handler.preferred_capabilities();
 
         // Parse client raw caps into typed. Silently skip unknown versions for

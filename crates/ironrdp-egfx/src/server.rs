@@ -1467,6 +1467,63 @@ impl GraphicsPipelineServer {
         Some(frame_id)
     }
 
+    /// Queue an RDP6 Planar bitmap frame for transmission via EGFX.
+    ///
+    /// Sends a pre-encoded RDP 6.0 Planar bitmap stream through `WireToSurface1`
+    /// with `Codec1Type::Planar`. Like [`Self::send_uncompressed_frame`], this is
+    /// for clients that support EGFX but not H.264 (AVC420/AVC444); Planar is
+    /// lossless and modestly compressed (RLE), so it costs far less bandwidth
+    /// than uncompressed.
+    ///
+    /// `planar_data` must be a valid RDP6 Planar bitmap stream covering
+    /// `dest_width` x `dest_height`, as produced by
+    /// `ironrdp_graphics::rdp6::BitmapStreamEncoder`.
+    ///
+    /// Returns `Some(frame_id)` if queued, `None` if not ready or backpressured.
+    pub fn send_planar_frame(
+        &mut self,
+        surface_id: u16,
+        planar_data: &[u8],
+        dest_width: u16,
+        dest_height: u16,
+        timestamp_ms: u32,
+    ) -> Option<u32> {
+        if !self.is_ready() {
+            return None;
+        }
+        if self.should_backpressure() {
+            self.qoe.record_backpressure();
+            return None;
+        }
+
+        let surface = self.surfaces.get(surface_id)?;
+
+        let timestamp = Self::make_timestamp(timestamp_ms);
+        let frame_id = self.frames.begin_frame(timestamp);
+
+        let dest_rect = ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: dest_width,
+            bottom: dest_height,
+        };
+
+        self.output_queue
+            .push_back(GfxPdu::StartFrame(StartFramePdu { timestamp, frame_id }));
+
+        self.output_queue.push_back(GfxPdu::WireToSurface1(WireToSurface1Pdu {
+            surface_id,
+            codec_id: Codec1Type::Planar,
+            pixel_format: surface.pixel_format,
+            destination_rectangle: dest_rect,
+            bitmap_data: planar_data.to_vec(),
+        }));
+
+        self.output_queue.push_back(GfxPdu::EndFrame(EndFramePdu { frame_id }));
+
+        Some(frame_id)
+    }
+
     /// Queue a RemoteFX Progressive frame for transmission.
     ///
     /// Progressive frames use `WireToSurface2Pdu` with a pre-encoded progressive

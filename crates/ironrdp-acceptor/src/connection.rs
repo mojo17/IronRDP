@@ -1,4 +1,5 @@
 use core::mem;
+use std::sync::Arc;
 
 use ironrdp_connector::{
     ConnectorError, ConnectorErrorExt as _, ConnectorResult, DesktopSize, Sequence, State, Written, encode_x224_packet,
@@ -37,7 +38,13 @@ pub struct Acceptor {
     received_credentials: Option<Credentials>,
     reactivation: bool,
     honor_client_desktop_size: bool,
+    desktop_size_policy: Option<DesktopSizePolicy>,
+    client_requested_desktop_size: Option<DesktopSize>,
 }
+
+/// Decides the desktop size a session is served at, given the size the client
+/// requested in its Client Core Data. See [`Acceptor::set_desktop_size_policy`].
+pub type DesktopSizePolicy = Arc<dyn Fn(DesktopSize) -> DesktopSize + Send + Sync>;
 
 /// Minimum and maximum desktop dimension honored from a client.
 ///
@@ -88,6 +95,15 @@ pub struct AcceptorResult {
     /// Servers that need to validate credentials (e.g., via PAM or LDAP)
     /// can use this field for post-handshake validation.
     pub credentials: Option<Credentials>,
+    /// The desktop size this activation was negotiated at: the size announced
+    /// in the Demand Active PDU (and the Monitor Layout PDU, when sent).
+    ///
+    /// It is the size the acceptor was constructed with, unless
+    /// [`Acceptor::set_desktop_size_policy`] or
+    /// [`Acceptor::set_honor_client_desktop_size`] replaced it. Unlike the
+    /// desktop size in the client's Confirm Active (found in `capabilities`),
+    /// it does not depend on the client echoing the server's value back.
+    pub desktop_size: DesktopSize,
 }
 
 impl Acceptor {
@@ -110,7 +126,45 @@ impl Acceptor {
             received_credentials: None,
             reactivation: false,
             honor_client_desktop_size: false,
+            desktop_size_policy: None,
+            client_requested_desktop_size: None,
         }
+    }
+
+    /// Let the embedder decide the desktop size of each session from the size
+    /// the client requested in its Client Core Data.
+    ///
+    /// `policy` is called once, when the MCS Connect Initial PDU is received,
+    /// with the client's requested size exactly as it appears on the wire. Its
+    /// return value becomes the session's desktop size: it is written into the
+    /// server's Bitmap capability set before Demand Active is sent, into the
+    /// Monitor Layout PDU, and reported in [`AcceptorResult::desktop_size`].
+    ///
+    /// # Security
+    ///
+    /// The argument is **untrusted, pre-authentication input**: any `u16`
+    /// pair, including `0×0` and `65535×65535`. The policy is the barricade;
+    /// it must return a size the server is actually willing to allocate
+    /// framebuffers and encoders for, whatever it is given. As a last line of
+    /// defense, a returned size with a zero dimension is discarded and the
+    /// size the acceptor was constructed with is kept.
+    ///
+    /// When a policy is set it takes precedence over
+    /// [`set_honor_client_desktop_size`](Self::set_honor_client_desktop_size),
+    /// which is then ignored. Without a policy (the default) nothing changes.
+    /// The policy is not consulted again on a Deactivation-Reactivation, where
+    /// the size is the one given to
+    /// [`new_deactivation_reactivation`](Self::new_deactivation_reactivation).
+    pub fn set_desktop_size_policy(&mut self, policy: DesktopSizePolicy) {
+        self.desktop_size_policy = Some(policy);
+    }
+
+    /// The desktop size the client requested in its Client Core Data, exactly
+    /// as received (unvalidated: it may be zero, odd, or absurdly large).
+    ///
+    /// `None` until the MCS Connect Initial PDU has been processed.
+    pub fn client_requested_desktop_size(&self) -> Option<DesktopSize> {
+        self.client_requested_desktop_size
     }
 
     /// Adopt the desktop size requested by the client in its Client Core Data
@@ -180,6 +234,8 @@ impl Acceptor {
             received_credentials: consumed.received_credentials,
             reactivation: true,
             honor_client_desktop_size: consumed.honor_client_desktop_size,
+            desktop_size_policy: consumed.desktop_size_policy,
+            client_requested_desktop_size: consumed.client_requested_desktop_size,
         })
     }
 
@@ -234,6 +290,7 @@ impl Acceptor {
                 io_channel_id: self.io_channel_id,
                 reactivation: self.reactivation,
                 credentials: self.received_credentials.take(),
+                desktop_size: self.desktop_size,
             }),
             previous_state => {
                 self.state = previous_state;
@@ -489,11 +546,39 @@ impl Sequence for Acceptor {
                 let gcc_blocks = settings_initial.conference_create_request.into_gcc_blocks();
                 let early_capability = gcc_blocks.core.optional_data.early_capability_flags;
 
-                // Adopt the client's requested desktop size (from its Client
-                // Core Data) before Demand Active is sent, so the session is
-                // negotiated at that size without a Deactivation-Reactivation
-                // resize. See `set_honor_client_desktop_size`.
-                if self.honor_client_desktop_size {
+                let requested_size = DesktopSize {
+                    width: gcc_blocks.core.desktop_width,
+                    height: gcc_blocks.core.desktop_height,
+                };
+                self.client_requested_desktop_size = Some(requested_size);
+
+                // An embedder-provided policy decides the size and takes
+                // precedence over the honor flag below. Its input is untrusted
+                // (pre-authentication); see `set_desktop_size_policy`.
+                if let Some(policy) = &self.desktop_size_policy {
+                    let served_size = policy(requested_size);
+                    if served_size.width == 0 || served_size.height == 0 {
+                        warn!(
+                            requested = ?requested_size,
+                            returned = ?served_size,
+                            kept = ?self.desktop_size,
+                            "Desktop size policy returned an empty size; keeping the server-provided size"
+                        );
+                    } else if served_size != self.desktop_size {
+                        debug!(
+                            requested = ?requested_size,
+                            served = ?served_size,
+                            previous = ?self.desktop_size,
+                            "Applying the desktop size policy"
+                        );
+                        self.desktop_size = served_size;
+                        set_bitmap_desktop_size(&mut self.server_capabilities, served_size);
+                    }
+                } else if self.honor_client_desktop_size {
+                    // Adopt the client's requested desktop size (from its Client
+                    // Core Data) before Demand Active is sent, so the session is
+                    // negotiated at that size without a Deactivation-Reactivation
+                    // resize. See `set_honor_client_desktop_size`.
                     if let Some(client_size) =
                         validate_desktop_size(gcc_blocks.core.desktop_width, gcc_blocks.core.desktop_height)
                     {

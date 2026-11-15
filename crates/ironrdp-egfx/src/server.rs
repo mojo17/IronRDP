@@ -1031,6 +1031,24 @@ pub trait GraphicsPipelineHandler: Send {
     /// based on [`preferred_capabilities()`](Self::preferred_capabilities).
     fn capabilities_advertise(&mut self, pdu: &CapabilitiesAdvertisePdu);
 
+    /// Veto hook, called right after [`capabilities_advertise`](Self::capabilities_advertise)
+    /// and before the server confirms capabilities. Return `false` to decline
+    /// EGFX for this client: the server then skips `CapabilitiesConfirm` and
+    /// never becomes ready, so the client falls back to the legacy bitmap output
+    /// path instead of being committed to a graphics pipeline the server cannot
+    /// fill.
+    ///
+    /// Default `true` (proceed). Override to decline when the client's advertised
+    /// capabilities are incompatible with what the server can actually send —
+    /// e.g. the client advertised no AVC support but the server only fills EGFX
+    /// with H.264/AVC420. (Without this, a client that advertises EGFX-without-AVC
+    /// — notably the iPad Windows App — gets its caps confirmed, is committed to
+    /// the graphics pipeline, then receives legacy bitmaps it does not expect and
+    /// disconnects with a protocol error.)
+    fn should_activate(&self) -> bool {
+        true
+    }
+
     /// Called when the EGFX channel is ready to send frames
     ///
     /// At this point, capability negotiation is complete.
@@ -2609,6 +2627,20 @@ impl GraphicsPipelineServer {
         }
 
         self.handler.capabilities_advertise(&pdu);
+
+        // Veto hook: if the handler declines (e.g. the client advertised no AVC
+        // but we only fill EGFX with H.264), skip CapabilitiesConfirm and stay in
+        // WaitingForCapabilities so the channel never becomes Ready. The client
+        // then falls back to the legacy bitmap output path. See
+        // `GraphicsPipelineHandler::should_activate`.
+        if !self.handler.should_activate() {
+            warn!(
+                "EGFX: handler declined activation (client caps incompatible with \
+                 server codecs); leaving channel un-negotiated, client falls back to legacy"
+            );
+            return;
+        }
+
         let server_caps = self.handler.preferred_capabilities();
 
         // Parse client raw caps into typed. Silently skip unknown versions for
@@ -3020,6 +3052,75 @@ mod tests {
     impl GraphicsPipelineHandler for DefaultsHandler {
         fn capabilities_advertise(&mut self, _pdu: &CapabilitiesAdvertisePdu) {}
         fn on_ready(&mut self, _negotiated: &CapabilitySet) {}
+    }
+
+    /// Handler that records `capabilities_advertise` and answers `should_activate`.
+    struct VetoHandler {
+        activate: bool,
+        advertised: std::sync::Arc<core::sync::atomic::AtomicBool>,
+        ready: std::sync::Arc<core::sync::atomic::AtomicBool>,
+    }
+
+    impl GraphicsPipelineHandler for VetoHandler {
+        fn capabilities_advertise(&mut self, _pdu: &CapabilitiesAdvertisePdu) {
+            self.advertised.store(true, core::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn should_activate(&self) -> bool {
+            self.activate
+        }
+
+        fn on_ready(&mut self, _negotiated: &CapabilitySet) {
+            self.ready.store(true, core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Runs one CapsAdvertise through a server whose handler answers `activate`.
+    /// Returns `(server, advertise_seen, on_ready_seen)`.
+    fn advertise_to(activate: bool) -> (GraphicsPipelineServer, bool, bool) {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let advertised = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(AtomicBool::new(false));
+        let mut server = GraphicsPipelineServer::new(Box::new(VetoHandler {
+            activate,
+            advertised: Arc::clone(&advertised),
+            ready: Arc::clone(&ready),
+        }));
+        let caps = [CapabilitySet::V10_6 {
+            flags: CapabilitiesV104Flags::empty(),
+        }];
+        server.handle_capabilities_advertise(CapabilitiesAdvertisePdu::from_typed(&caps));
+        (server, advertised.load(Ordering::SeqCst), ready.load(Ordering::SeqCst))
+    }
+
+    /// `should_activate() == false` declines EGFX: no CapabilitiesConfirm, never
+    /// Ready, `on_ready` never fires, so the client falls back to legacy output.
+    #[test]
+    fn should_activate_false_declines_activation() {
+        let (server, advertised, on_ready) = advertise_to(false);
+
+        assert!(advertised, "capabilities_advertise runs before the veto");
+        assert!(!server.is_ready());
+        assert!(server.negotiated_capabilities().is_none());
+        assert!(server.output_queue.is_empty(), "no CapabilitiesConfirm may be queued");
+        assert!(!on_ready);
+    }
+
+    /// Control: the default (`true`) still confirms and becomes ready.
+    #[test]
+    fn should_activate_true_activates() {
+        assert!(DefaultsHandler.should_activate());
+
+        let (server, _, on_ready) = advertise_to(true);
+
+        assert!(server.is_ready());
+        assert!(matches!(
+            server.output_queue.front(),
+            Some(GfxPdu::CapabilitiesConfirm(_))
+        ));
+        assert!(on_ready);
     }
 
     /// Negotiation matches exact versions, so the default ladder must declare

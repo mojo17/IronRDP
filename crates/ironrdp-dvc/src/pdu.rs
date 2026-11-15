@@ -1,3 +1,4 @@
+use alloc::collections::BTreeSet;
 use alloc::format;
 use core::fmt;
 
@@ -13,10 +14,13 @@ use ironrdp_svc::SvcEncode;
 use crate::{DynamicChannelId, String, Vec};
 
 /// Dynamic Virtual Channel PDU's that are sent by both client and server.
+#[non_exhaustive]
 #[derive(Debug, PartialEq)]
 pub enum DrdynvcDataPdu {
     DataFirst(DataFirstPdu),
     Data(DataPdu),
+    DataFirstCompressed(DataFirstCompressedPdu),
+    DataCompressed(DataCompressedPdu),
 }
 
 impl DrdynvcDataPdu {
@@ -27,6 +31,21 @@ impl DrdynvcDataPdu {
         match self {
             DrdynvcDataPdu::DataFirst(pdu) => pdu.channel_id,
             DrdynvcDataPdu::Data(pdu) => pdu.channel_id,
+            DrdynvcDataPdu::DataFirstCompressed(pdu) => pdu.0.channel_id,
+            DrdynvcDataPdu::DataCompressed(pdu) => pdu.0.channel_id,
+        }
+    }
+
+    /// Decodes the data PDU that `header` announces. Data PDUs are the same in both directions.
+    fn decode(header: Header, src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        match header.cmd {
+            Cmd::DataFirst => Ok(Self::DataFirst(DataFirstPdu::decode(header, src)?)),
+            Cmd::Data => Ok(Self::Data(DataPdu::decode(header, src)?)),
+            Cmd::DataFirstCompressed => Ok(Self::DataFirstCompressed(DataFirstCompressedPdu(DataFirstPdu::decode(
+                header, src,
+            )?))),
+            Cmd::DataCompressed => Ok(Self::DataCompressed(DataCompressedPdu(DataPdu::decode(header, src)?))),
+            _ => Err(unsupported_value_err!("Cmd", header.cmd.into(), in: src)),
         }
     }
 }
@@ -36,6 +55,8 @@ impl Encode for DrdynvcDataPdu {
         match self {
             DrdynvcDataPdu::DataFirst(pdu) => pdu.encode(dst),
             DrdynvcDataPdu::Data(pdu) => pdu.encode(dst),
+            DrdynvcDataPdu::DataFirstCompressed(pdu) => pdu.0.encode(dst),
+            DrdynvcDataPdu::DataCompressed(pdu) => pdu.0.encode(dst),
         }
     }
 
@@ -43,6 +64,8 @@ impl Encode for DrdynvcDataPdu {
         match self {
             DrdynvcDataPdu::DataFirst(_) => DataFirstPdu::name(),
             DrdynvcDataPdu::Data(_) => DataPdu::name(),
+            DrdynvcDataPdu::DataFirstCompressed(_) => DataFirstCompressedPdu::name(),
+            DrdynvcDataPdu::DataCompressed(_) => DataCompressedPdu::name(),
         }
     }
 
@@ -50,17 +73,21 @@ impl Encode for DrdynvcDataPdu {
         match self {
             DrdynvcDataPdu::DataFirst(pdu) => pdu.size(),
             DrdynvcDataPdu::Data(pdu) => pdu.size(),
+            DrdynvcDataPdu::DataFirstCompressed(pdu) => pdu.0.size(),
+            DrdynvcDataPdu::DataCompressed(pdu) => pdu.0.size(),
         }
     }
 }
 
 /// Dynamic Virtual Channel PDU's that are sent by the client.
+#[non_exhaustive]
 #[derive(Debug, PartialEq)]
 pub enum DrdynvcClientPdu {
     Capabilities(CapabilitiesResponsePdu),
     Create(CreateResponsePdu),
     Close(ClosePdu),
     Data(DrdynvcDataPdu),
+    SoftSyncResponse(SoftSyncResponsePdu),
 }
 
 impl Encode for DrdynvcClientPdu {
@@ -70,6 +97,7 @@ impl Encode for DrdynvcClientPdu {
             DrdynvcClientPdu::Create(pdu) => pdu.encode(dst),
             DrdynvcClientPdu::Data(pdu) => pdu.encode(dst),
             DrdynvcClientPdu::Close(pdu) => pdu.encode(dst),
+            DrdynvcClientPdu::SoftSyncResponse(pdu) => pdu.encode(dst),
         }
     }
 
@@ -79,6 +107,7 @@ impl Encode for DrdynvcClientPdu {
             DrdynvcClientPdu::Create(_) => CreateResponsePdu::name(),
             DrdynvcClientPdu::Data(pdu) => pdu.name(),
             DrdynvcClientPdu::Close(_) => ClosePdu::name(),
+            DrdynvcClientPdu::SoftSyncResponse(_) => SoftSyncResponsePdu::name(),
         }
     }
 
@@ -88,6 +117,7 @@ impl Encode for DrdynvcClientPdu {
             DrdynvcClientPdu::Create(pdu) => pdu.size(),
             DrdynvcClientPdu::Data(pdu) => pdu.size(),
             DrdynvcClientPdu::Close(pdu) => pdu.size(),
+            DrdynvcClientPdu::SoftSyncResponse(pdu) => pdu.size(),
         }
     }
 }
@@ -97,24 +127,26 @@ impl Decode<'_> for DrdynvcClientPdu {
         let header = Header::decode(src)?;
         match header.cmd {
             Cmd::Create => Ok(Self::Create(CreateResponsePdu::decode(header, src)?)),
-            Cmd::DataFirst => Ok(Self::Data(DrdynvcDataPdu::DataFirst(DataFirstPdu::decode(
-                header, src,
-            )?))),
-            Cmd::Data => Ok(Self::Data(DrdynvcDataPdu::Data(DataPdu::decode(header, src)?))),
+            Cmd::DataFirst | Cmd::Data | Cmd::DataFirstCompressed | Cmd::DataCompressed => {
+                Ok(Self::Data(DrdynvcDataPdu::decode(header, src)?))
+            }
             Cmd::Close => Ok(Self::Close(ClosePdu::decode(header, src)?)),
             Cmd::Capability => Ok(Self::Capabilities(CapabilitiesResponsePdu::decode(header, src)?)),
-            _ => Err(unsupported_value_err!("Cmd", header.cmd.into())),
+            Cmd::SoftSyncResponse => Ok(Self::SoftSyncResponse(SoftSyncResponsePdu::decode(header, src)?)),
+            _ => Err(unsupported_value_err!("Cmd", header.cmd.into(), in: src)),
         }
     }
 }
 
 /// Dynamic Virtual Channel PDU's that are sent by the server.
+#[non_exhaustive]
 #[derive(Debug, PartialEq)]
 pub enum DrdynvcServerPdu {
     Capabilities(CapabilitiesRequestPdu),
     Create(CreateRequestPdu),
     Close(ClosePdu),
     Data(DrdynvcDataPdu),
+    SoftSyncRequest(SoftSyncRequestPdu),
 }
 
 impl Encode for DrdynvcServerPdu {
@@ -124,6 +156,7 @@ impl Encode for DrdynvcServerPdu {
             DrdynvcServerPdu::Capabilities(pdu) => pdu.encode(dst),
             DrdynvcServerPdu::Create(pdu) => pdu.encode(dst),
             DrdynvcServerPdu::Close(pdu) => pdu.encode(dst),
+            DrdynvcServerPdu::SoftSyncRequest(pdu) => pdu.encode(dst),
         }
     }
 
@@ -133,6 +166,7 @@ impl Encode for DrdynvcServerPdu {
             DrdynvcServerPdu::Capabilities(pdu) => pdu.name(),
             DrdynvcServerPdu::Create(_) => CreateRequestPdu::name(),
             DrdynvcServerPdu::Close(_) => ClosePdu::name(),
+            DrdynvcServerPdu::SoftSyncRequest(_) => SoftSyncRequestPdu::name(),
         }
     }
 
@@ -142,6 +176,7 @@ impl Encode for DrdynvcServerPdu {
             DrdynvcServerPdu::Capabilities(pdu) => pdu.size(),
             DrdynvcServerPdu::Create(pdu) => pdu.size(),
             DrdynvcServerPdu::Close(pdu) => pdu.size(),
+            DrdynvcServerPdu::SoftSyncRequest(pdu) => pdu.size(),
         }
     }
 }
@@ -151,13 +186,13 @@ impl Decode<'_> for DrdynvcServerPdu {
         let header = Header::decode(src)?;
         match header.cmd {
             Cmd::Create => Ok(Self::Create(CreateRequestPdu::decode(header, src)?)),
-            Cmd::DataFirst => Ok(Self::Data(DrdynvcDataPdu::DataFirst(DataFirstPdu::decode(
-                header, src,
-            )?))),
-            Cmd::Data => Ok(Self::Data(DrdynvcDataPdu::Data(DataPdu::decode(header, src)?))),
+            Cmd::DataFirst | Cmd::Data | Cmd::DataFirstCompressed | Cmd::DataCompressed => {
+                Ok(Self::Data(DrdynvcDataPdu::decode(header, src)?))
+            }
             Cmd::Close => Ok(Self::Close(ClosePdu::decode(header, src)?)),
             Cmd::Capability => Ok(Self::Capabilities(CapabilitiesRequestPdu::decode(header, src)?)),
-            _ => Err(unsupported_value_err!("Cmd", header.cmd.into())),
+            Cmd::SoftSyncRequest => Ok(Self::SoftSyncRequest(SoftSyncRequestPdu::decode(header, src)?)),
+            _ => Err(unsupported_value_err!("Cmd", header.cmd.into(), in: src)),
         }
     }
 }
@@ -166,6 +201,353 @@ impl Decode<'_> for DrdynvcServerPdu {
 impl SvcEncode for DrdynvcDataPdu {}
 impl SvcEncode for DrdynvcClientPdu {}
 impl SvcEncode for DrdynvcServerPdu {}
+
+/// A multitransport tunnel used for Soft-Sync.
+///
+/// Defined in [\[MS-RDPEDYC\] 2.2.5.1.1] and [\[MS-RDPEDYC\] 2.2.5.2].
+///
+/// [\[MS-RDPEDYC\] 2.2.5.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpedyc/20a29627-6966-4085-b5f1-00112a6114e3
+/// [\[MS-RDPEDYC\] 2.2.5.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpedyc/2f9c83aa-8c82-4d85-a7fe-b4c6301a9f90
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SoftSyncTunnelType(u32);
+
+impl SoftSyncTunnelType {
+    /// Reliable RDP-UDP FEC tunnel.
+    pub const RELIABLE_UDP: Self = Self(0x0000_0001);
+    /// Lossy RDP-UDP FEC tunnel.
+    pub const LOSSY_UDP: Self = Self(0x0000_0003);
+}
+
+impl From<u32> for SoftSyncTunnelType {
+    fn from(value: u32) -> Self {
+        Self(value)
+    }
+}
+
+impl From<SoftSyncTunnelType> for u32 {
+    fn from(value: SoftSyncTunnelType) -> Self {
+        value.0
+    }
+}
+
+/// A group of dynamic virtual channels sent over one Soft-Sync tunnel.
+///
+/// Defined in [\[MS-RDPEDYC\] 2.2.5.1.1].
+///
+/// [\[MS-RDPEDYC\] 2.2.5.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpedyc/20a29627-6966-4085-b5f1-00112a6114e3
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoftSyncChannelList {
+    tunnel_type: SoftSyncTunnelType,
+    channel_ids: Vec<DynamicChannelId>,
+}
+
+impl SoftSyncChannelList {
+    const FIXED_PART_SIZE: usize = 4 /* TunnelType */ + 2 /* NumberOfDVCs */;
+
+    /// Creates a channel list for a multitransport tunnel.
+    pub fn new(tunnel_type: SoftSyncTunnelType, channel_ids: Vec<DynamicChannelId>) -> Self {
+        Self {
+            tunnel_type,
+            channel_ids,
+        }
+    }
+
+    /// Returns the tunnel selected for these channels.
+    pub fn tunnel_type(&self) -> SoftSyncTunnelType {
+        self.tunnel_type
+    }
+
+    /// Returns the dynamic virtual channels assigned to this tunnel.
+    pub fn channel_ids(&self) -> &[DynamicChannelId] {
+        &self.channel_ids
+    }
+
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        dst.write_u32(self.tunnel_type.into());
+        dst.write_u16(cast_length!("NumberOfDVCs", self.channel_ids.len())?);
+        for channel_id in &self.channel_ids {
+            dst.write_u32(*channel_id);
+        }
+        Ok(())
+    }
+
+    fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        ensure_size!(in: src, size: Self::FIXED_PART_SIZE);
+
+        let tunnel_type = SoftSyncTunnelType::from(src.read_u32());
+        let number_of_dvcs = usize::from(src.read_u16());
+        ensure_size!(in: src, size: number_of_dvcs * 4 /* ListOfDVCIds */);
+
+        let mut channel_ids = Vec::with_capacity(number_of_dvcs);
+        for _ in 0..number_of_dvcs {
+            channel_ids.push(src.read_u32());
+        }
+
+        Ok(Self {
+            tunnel_type,
+            channel_ids,
+        })
+    }
+
+    fn size(&self) -> usize {
+        Self::FIXED_PART_SIZE + self.channel_ids.len() * 4 /* ListOfDVCIds */
+    }
+}
+
+/// Soft-Sync request sent by the DVC server manager.
+///
+/// Defined in [\[MS-RDPEDYC\] 2.2.5.1].
+///
+/// [\[MS-RDPEDYC\] 2.2.5.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpedyc/98c6b432-842d-4d43-b1fb-ae02f945feee
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoftSyncRequestPdu {
+    channel_lists: Vec<SoftSyncChannelList>,
+}
+
+impl SoftSyncRequestPdu {
+    const TCP_FLUSHED: u16 = 0x0001;
+    const CHANNEL_LIST_PRESENT: u16 = 0x0002;
+    const LENGTH_FIXED_PART_SIZE: usize = 4 /* Length */ + 2 /* Flags */ + 2 /* NumberOfTunnels */;
+    const FIXED_PART_SIZE: usize = Header::FIXED_PART_SIZE + 1 /* Pad */ + Self::LENGTH_FIXED_PART_SIZE;
+
+    /// Creates a Soft-Sync request for the supplied tunnel/channel assignments.
+    pub fn new(channel_lists: Vec<SoftSyncChannelList>) -> Self {
+        Self { channel_lists }
+    }
+
+    /// Returns the tunnel/channel assignments announced by this request.
+    pub fn channel_lists(&self) -> &[SoftSyncChannelList] {
+        &self.channel_lists
+    }
+
+    fn flags(&self) -> u16 {
+        Self::TCP_FLUSHED
+            | if self.channel_lists.is_empty() {
+                0
+            } else {
+                Self::CHANNEL_LIST_PRESENT
+            }
+    }
+
+    fn validate(&self) -> EncodeResult<()> {
+        let _: u16 = cast_length!("NumberOfTunnels", self.channel_lists.len())?;
+        let mut tunnel_types = BTreeSet::new();
+        let mut channel_ids = BTreeSet::new();
+
+        for list in &self.channel_lists {
+            let _: u16 = cast_length!("NumberOfDVCs", list.channel_ids.len())?;
+            if !tunnel_types.insert(list.tunnel_type) {
+                return Err(invalid_field_err!(
+                    "TunnelType",
+                    "appears in more than one channel list"
+                ));
+            }
+            for channel_id in &list.channel_ids {
+                if !channel_ids.insert(*channel_id) {
+                    return Err(invalid_field_err!(
+                        "ListOfDVCIds",
+                        "channel ID appears in more than one channel list"
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn decode(header: Header, src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        if header.cb_id != FieldType::U8 || header.sp != FieldType::U8 {
+            return Err(invalid_field_err!("Header", "cbId and Sp must be zero"));
+        }
+        ensure_size!(in: src, size: Self::FIXED_PART_SIZE - Header::FIXED_PART_SIZE);
+
+        let headerless_size = src.len();
+        let pad = src.read_u8();
+        if pad != 0 {
+            return Err(invalid_field_err!("Pad", "must be zero"));
+        }
+        let length = usize::try_from(src.read_u32()).map_err(|_| invalid_field_err!("Length", "is too large"))?;
+        if length != headerless_size - 1
+        /* Pad */
+        {
+            return Err(invalid_field_err!(
+                "Length",
+                "does not match the bytes following the pad field"
+            ));
+        }
+
+        let flags = src.read_u16();
+        if flags & Self::TCP_FLUSHED == 0 {
+            return Err(invalid_field_err!("Flags", "SOFT_SYNC_TCP_FLUSHED must be set"));
+        }
+
+        let number_of_tunnels = usize::from(src.read_u16());
+        if number_of_tunnels > src.len() / SoftSyncChannelList::FIXED_PART_SIZE {
+            return Err(invalid_field_err!(
+                "NumberOfTunnels",
+                "does not fit in the remaining bytes"
+            ));
+        }
+
+        let mut channel_lists = Vec::with_capacity(number_of_tunnels);
+        let mut tunnel_types = BTreeSet::new();
+        let mut channel_ids = BTreeSet::new();
+        for _ in 0..number_of_tunnels {
+            let list = SoftSyncChannelList::decode(src)?;
+            if !tunnel_types.insert(list.tunnel_type) {
+                return Err(invalid_field_err!(
+                    "TunnelType",
+                    "appears in more than one channel list"
+                ));
+            }
+            for channel_id in &list.channel_ids {
+                if !channel_ids.insert(*channel_id) {
+                    return Err(invalid_field_err!(
+                        "ListOfDVCIds",
+                        "channel ID appears in more than one channel list"
+                    ));
+                }
+            }
+            channel_lists.push(list);
+        }
+        if !src.is_empty() {
+            return Err(invalid_field_err!("Length", "contains trailing bytes"));
+        }
+
+        Ok(Self { channel_lists })
+    }
+
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        self.validate()?;
+        ensure_size!(in: dst, size: self.size());
+
+        Header::new(0, 0, Cmd::SoftSyncRequest).encode(dst)?;
+        dst.write_u8(0);
+        dst.write_u32(cast_length!("Length", self.length())?);
+        dst.write_u16(self.flags());
+        dst.write_u16(cast_length!("NumberOfTunnels", self.channel_lists.len())?);
+        for list in &self.channel_lists {
+            list.encode(dst)?;
+        }
+
+        Ok(())
+    }
+
+    fn name() -> &'static str {
+        "DYNVC_SOFT_SYNC_REQUEST"
+    }
+
+    fn length(&self) -> usize {
+        Self::LENGTH_FIXED_PART_SIZE + self.channel_lists.iter().map(SoftSyncChannelList::size).sum::<usize>()
+    }
+
+    fn size(&self) -> usize {
+        Header::FIXED_PART_SIZE + 1 /* Pad */ + self.length()
+    }
+}
+
+/// Soft-Sync response sent by the DVC client manager.
+///
+/// Defined in [\[MS-RDPEDYC\] 2.2.5.2].
+///
+/// [\[MS-RDPEDYC\] 2.2.5.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpedyc/2f9c83aa-8c82-4d85-a7fe-b4c6301a9f90
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoftSyncResponsePdu {
+    tunnels_to_switch: Vec<SoftSyncTunnelType>,
+}
+
+impl SoftSyncResponsePdu {
+    const FIXED_PART_SIZE: usize = Header::FIXED_PART_SIZE + 1 /* Pad */ + 4 /* NumberOfTunnels */;
+
+    /// Creates a Soft-Sync response for the tunnels on which the client will write DVC data.
+    pub fn new(tunnels_to_switch: Vec<SoftSyncTunnelType>) -> Self {
+        Self { tunnels_to_switch }
+    }
+
+    /// Returns the tunnels on which the client will write DVC data.
+    pub fn tunnels_to_switch(&self) -> &[SoftSyncTunnelType] {
+        &self.tunnels_to_switch
+    }
+
+    fn validate(&self) -> EncodeResult<()> {
+        let _: u32 = cast_length!("NumberOfTunnels", self.tunnels_to_switch.len())?;
+        let mut tunnels = BTreeSet::new();
+        for tunnel in &self.tunnels_to_switch {
+            if !tunnels.insert(*tunnel) {
+                return Err(invalid_field_err!(
+                    "TunnelsToSwitch",
+                    "contains a duplicate tunnel type"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn decode(header: Header, src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        if header.cb_id != FieldType::U8 || header.sp != FieldType::U8 {
+            return Err(invalid_field_err!("Header", "cbId and Sp must be zero"));
+        }
+        ensure_size!(in: src, size: Self::FIXED_PART_SIZE - Header::FIXED_PART_SIZE);
+
+        let pad = src.read_u8();
+        if pad != 0 {
+            return Err(invalid_field_err!("Pad", "must be zero"));
+        }
+        let number_of_tunnels =
+            usize::try_from(src.read_u32()).map_err(|_| invalid_field_err!("NumberOfTunnels", "is too large"))?;
+        if number_of_tunnels > src.len() / 4
+        /* TunnelsToSwitch */
+        {
+            return Err(invalid_field_err!(
+                "NumberOfTunnels",
+                "does not fit in the remaining bytes"
+            ));
+        }
+
+        let mut tunnels_to_switch = Vec::with_capacity(number_of_tunnels);
+        let mut tunnels = BTreeSet::new();
+        for _ in 0..number_of_tunnels {
+            let tunnel = SoftSyncTunnelType::from(src.read_u32());
+            if !tunnels.insert(tunnel) {
+                return Err(invalid_field_err!(
+                    "TunnelsToSwitch",
+                    "contains a duplicate tunnel type"
+                ));
+            }
+            tunnels_to_switch.push(tunnel);
+        }
+        if !src.is_empty() {
+            return Err(invalid_field_err!(
+                "NumberOfTunnels",
+                "does not match the remaining bytes"
+            ));
+        }
+
+        Ok(Self { tunnels_to_switch })
+    }
+
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        self.validate()?;
+        ensure_size!(in: dst, size: self.size());
+
+        Header::new(0, 0, Cmd::SoftSyncResponse).encode(dst)?;
+        dst.write_u8(0);
+        dst.write_u32(cast_length!("NumberOfTunnels", self.tunnels_to_switch.len())?);
+        for tunnel in &self.tunnels_to_switch {
+            dst.write_u32((*tunnel).into());
+        }
+
+        Ok(())
+    }
+
+    fn name() -> &'static str {
+        "DYNVC_SOFT_SYNC_RESPONSE"
+    }
+
+    fn size(&self) -> usize {
+        Self::FIXED_PART_SIZE + self.tunnels_to_switch.len() * 4 /* TunnelsToSwitch */
+    }
+}
 
 /// [2.2] Message Syntax
 ///
@@ -364,7 +746,7 @@ impl DataFirstPdu {
         self.header.cb_id.encode_val(self.channel_id, dst)?;
         self.header
             .sp
-            .encode_val(cast_length!("DataFirstPdu::Length", self.length)?, dst)?;
+            .encode_val(cast_length!("DataFirstPdu::Length", self.length, in: dst)?, dst)?;
         dst.write_slice(&self.data);
         Ok(())
     }
@@ -383,6 +765,76 @@ impl DataFirstPdu {
     }
 }
 
+/// 2.2.3.3 DVC Data First Compressed PDU (DYNVC_DATA_FIRST_COMPRESSED)
+///
+/// Like [`DataFirstPdu`], but the data block is compressed with RDP 8.0 Lite, and the length
+/// counts uncompressed bytes. Only sent once both sides negotiated version 3, over a
+/// reliable transport.
+///
+/// RDP 8.0 Lite is RDP 8.0 bulk compression (MS-RDPEGFX 3.1.9.1) restricted to an
+/// RDP_SEGMENTED_DATA structure holding a single segment of compression type
+/// `PACKET_COMPR_TYPE_RDP8_LITE` (0x06), at most 8,192 uncompressed bytes per segment, and an
+/// 8,192-byte history. The graphics pipeline's RDP 8.0 output does not meet these limits
+/// and is not a valid payload.
+#[derive(Debug, PartialEq)]
+pub struct DataFirstCompressedPdu(DataFirstPdu);
+
+impl DataFirstCompressedPdu {
+    /// `total_length` is the *uncompressed* length of the whole message, and `data` is the
+    /// first block, compressed with RDP 8.0 Lite as described on [`DataFirstCompressedPdu`].
+    pub fn new(channel_id: DynamicChannelId, total_length: u32, data: Vec<u8>) -> Self {
+        Self(DataFirstPdu {
+            header: Header::new(channel_id, total_length, Cmd::DataFirstCompressed),
+            channel_id,
+            length: total_length,
+            data,
+        })
+    }
+
+    /// Returns the uncompressed length of the whole message.
+    pub fn length(&self) -> u32 {
+        self.0.length
+    }
+
+    /// Returns the compressed data block.
+    pub fn data(&self) -> &[u8] {
+        &self.0.data
+    }
+
+    fn name() -> &'static str {
+        "DYNVC_DATA_FIRST_COMPRESSED"
+    }
+}
+
+/// 2.2.3.4 DVC Data Compressed PDU (DYNVC_DATA_COMPRESSED)
+///
+/// Like [`DataPdu`], but the data block is compressed with RDP 8.0 Lite, as described on
+/// [`DataFirstCompressedPdu`]. Only sent once both sides negotiated version 3, over a
+/// reliable transport.
+#[derive(Debug, PartialEq)]
+pub struct DataCompressedPdu(DataPdu);
+
+impl DataCompressedPdu {
+    /// `data` is the data block, compressed with RDP 8.0 Lite as described on
+    /// [`DataFirstCompressedPdu`].
+    pub fn new(channel_id: DynamicChannelId, data: Vec<u8>) -> Self {
+        Self(DataPdu {
+            header: Header::new(channel_id, 0, Cmd::DataCompressed),
+            channel_id,
+            data,
+        })
+    }
+
+    /// Returns the compressed data block.
+    pub fn data(&self) -> &[u8] {
+        &self.0.data
+    }
+
+    fn name() -> &'static str {
+        "DYNVC_DATA_COMPRESSED"
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct FieldType(u8);
 
@@ -394,10 +846,10 @@ impl FieldType {
     fn encode_val(&self, value: u32, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size_of_val());
         match *self {
-            FieldType::U8 => dst.write_u8(cast_length!("FieldType::encode", value)?),
-            FieldType::U16 => dst.write_u16(cast_length!("FieldType::encode", value)?),
+            FieldType::U8 => dst.write_u8(cast_length!("FieldType::encode", value, in: dst)?),
+            FieldType::U16 => dst.write_u16(cast_length!("FieldType::encode", value, in: dst)?),
             FieldType::U32 => dst.write_u32(value),
-            _ => return Err(invalid_field_err!("FieldType", "invalid field type")),
+            _ => return Err(invalid_field_err!("FieldType", "invalid field type", in: dst)),
         };
         Ok(())
     }
@@ -408,7 +860,7 @@ impl FieldType {
             FieldType::U8 => Ok(u32::from(src.read_u8())),
             FieldType::U16 => Ok(u32::from(src.read_u16())),
             FieldType::U32 => Ok(src.read_u32()),
-            _ => Err(invalid_field_err!("FieldType", "invalid field type")),
+            _ => Err(invalid_field_err!("FieldType", "invalid field type", in: src)),
         }
     }
 

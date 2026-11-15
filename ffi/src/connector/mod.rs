@@ -7,10 +7,10 @@ pub mod state;
 pub mod ffi {
     use core::fmt::Write as _;
 
-    use diplomat_runtime::DiplomatWriteable;
+    use diplomat_runtime::DiplomatWrite;
     use ironrdp::connector::Sequence as _;
     use ironrdp::displaycontrol::client::DisplayControlClient;
-    use ironrdp::dvc::DvcProcessor;
+    use ironrdp::dvc::DvcClientProcessor;
     use ironrdp_dvc_pipe_proxy::DvcNamedPipeProxy;
     use tracing::info;
 
@@ -23,8 +23,9 @@ pub mod ffi {
     use crate::error::ValueConsumedError;
     use crate::error::ffi::{IronRdpError, IronRdpErrorKind};
     use crate::pdu::ffi::WriteBuf;
+    use crate::utils::monotonic_now;
 
-    #[diplomat::opaque] // We must use Option here, as ClientConnector is not Clone and have functions that consume it
+    #[diplomat::opaque_mut] // We must use Option here, as ClientConnector is not Clone and have functions that consume it
     pub struct ClientConnector(pub Option<ironrdp::connector::ClientConnector>);
 
     // Basic Impl for ClientConnector
@@ -54,6 +55,12 @@ pub mod ffi {
 
         // FIXME: We need to create opaque for ironrdp::rdpdr::Rdpdr
         /// Must use
+        ///
+        /// Announces a smartcard device. On Windows, calls are passed through to the local
+        /// WinSCard service; elsewhere every call fails with `SCARD_E_NO_SERVICE`.
+        ///
+        /// Some WinSCard calls complete asynchronously: call `ActiveStage::poll_rdpdr_deferred`
+        /// periodically to send their results to the server.
         pub fn with_static_channel_rdpdr(
             &mut self,
             computer_name: &str,
@@ -62,19 +69,31 @@ pub mod ffi {
             let Some(connector) = self.0.take() else {
                 return Err(ValueConsumedError::for_item("connector").into());
             };
-            self.0 = Some(
-                connector.with_static_channel(
-                    ironrdp::rdpdr::Rdpdr::new(Box::new(ironrdp::rdpdr::NoopRdpdrBackend {}), computer_name.to_owned())
-                        .with_smartcard(smart_card_device_id),
-                ),
+
+            #[cfg(windows)]
+            let backend: Box<dyn ironrdp::rdpdr::RdpdrBackend> = Box::new(
+                ironrdp_rdpdr_native::WindowsRdpdrBackendFactory::from_drives(Vec::new())
+                    .map_err(|error| {
+                        crate::error::GenericError(
+                            anyhow::Error::new(error).context("invalid RDPDR backend configuration"),
+                        )
+                    })?
+                    .with_smartcard(true)
+                    .build(),
             );
+            #[cfg(not(windows))]
+            let backend: Box<dyn ironrdp::rdpdr::RdpdrBackend> = Box::new(ironrdp::rdpdr::NoopRdpdrBackend);
+
+            self.0 = Some(connector.with_static_channel(
+                ironrdp::rdpdr::Rdpdr::new(backend, computer_name.to_owned()).with_smartcard(smart_card_device_id),
+            ));
 
             Ok(())
         }
 
         fn with_dvc<T>(&mut self, processor: T) -> Result<(), Box<IronRdpError>>
         where
-            T: DvcProcessor + 'static,
+            T: DvcClientProcessor + 'static,
         {
             let Some(connector) = &mut self.0 else {
                 return Err(ValueConsumedError::for_item("connector").into());
@@ -152,11 +171,53 @@ pub mod ffi {
             Ok(())
         }
 
+        /// Send X.224 with an explicit protocol set (VMConnect uses HYBRID only).
+        pub fn initiate_with_security_protocol(
+            &mut self,
+            security_protocol: u32,
+            write_buf: &mut WriteBuf,
+        ) -> Result<Box<Written>, Box<IronRdpError>> {
+            let Some(connector) = self.0.as_mut() else {
+                return Err(ValueConsumedError::for_item("connector").into());
+            };
+            let security_protocol = ironrdp::pdu::nego::SecurityProtocol::from_bits(security_protocol)
+                .ok_or_else(|| ironrdp::connector::general_err!("invalid security protocol"))?;
+            let written = connector.initiate_with_security_protocol(security_protocol, &mut write_buf.0)?;
+            Ok(Box::new(Written(written)))
+        }
+
+        /// Drop host identity after pre-X.224 CredSSP so it is not forwarded into guest RDP.
+        pub fn clear_credentials_after_host_auth(&mut self) -> Result<(), Box<IronRdpError>> {
+            let Some(connector) = self.0.as_mut() else {
+                return Err(ValueConsumedError::for_item("connector").into());
+            };
+            connector.config.credentials = ironrdp::connector::Credentials::UsernamePassword {
+                username: String::new(),
+                password: String::new(),
+            };
+            connector.config.domain = None;
+            connector.config.autologon = false;
+            Ok(())
+        }
+
+        /// Require EnhancedSecurityUpgrade with HYBRID, matching ironrdp-vmconnect::connect_front.
+        pub fn ensure_selected_hybrid(&self) -> Result<(), Box<IronRdpError>> {
+            let Some(connector) = self.0.as_ref() else {
+                return Err(ValueConsumedError::for_item("connector").into());
+            };
+            ironrdp_vmconnect::ensure_selected_credssp(&connector.state).map_err(Into::into)
+        }
+
         pub fn step(&mut self, input: &[u8], write_buf: &mut WriteBuf) -> Result<Box<Written>, Box<IronRdpError>> {
             let Some(connector) = self.0.as_mut() else {
                 return Err(ValueConsumedError::for_item("connector").into());
             };
-            let written = connector.step(input, &mut write_buf.0)?;
+            // The FFI surface has no parameter through which the .NET caller could pass
+            // when it read `input`, so this stamps on entry to the call instead. That is
+            // at least as accurate as the other drivers' `last_read_at`, which is also a
+            // post-read stamp taken right after the read completes rather than exactly
+            // when the first byte arrived.
+            let written = connector.step(input, Some(monotonic_now()), &mut write_buf.0)?;
             Ok(Box::new(Written(written)))
         }
 
@@ -181,7 +242,7 @@ pub mod ffi {
             Ok(())
         }
 
-        pub fn next_pdu_hint(&self) -> Result<Option<Box<PduHint<'_>>>, Box<IronRdpError>> {
+        pub fn next_pdu_hint<'a>(&'a self) -> Result<Option<Box<PduHint<'a>>>, Box<IronRdpError>> {
             let Some(connector) = self.0.as_ref() else {
                 return Err(ValueConsumedError::for_item("connector").into());
             };
@@ -189,7 +250,8 @@ pub mod ffi {
             Ok(connector.next_pdu_hint().map(PduHint).map(Box::new))
         }
 
-        pub fn get_dyn_state(&self) -> Result<Box<DynState<'_>>, Box<IronRdpError>> {
+        #[diplomat::attr(auto, getter = "dyn_state")]
+        pub fn get_dyn_state<'a>(&'a self) -> Result<Box<DynState<'a>>, Box<IronRdpError>> {
             let Some(connector) = self.0.as_ref() else {
                 return Err(ValueConsumedError::for_item("connector").into());
             };
@@ -222,7 +284,8 @@ pub mod ffi {
     pub struct DynState<'a>(pub &'a dyn ironrdp::connector::State);
 
     impl<'a> DynState<'a> {
-        pub fn get_name(&'a self, writeable: &'a mut DiplomatWriteable) -> Result<(), Box<IronRdpError>> {
+        #[diplomat::attr(auto, getter = "name")]
+        pub fn get_name(&'a self, writeable: &'a mut DiplomatWrite) -> Result<(), Box<IronRdpError>> {
             let name = self.0.name();
             write!(writeable, "{name}")?;
             Ok(())

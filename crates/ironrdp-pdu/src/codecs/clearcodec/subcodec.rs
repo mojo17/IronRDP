@@ -68,12 +68,12 @@ fn decode_single_subcodec<'a>(src: &mut ReadCursor<'a>) -> DecodeResult<Subcodec
     let y_start = src.read_u16();
     let width = src.read_u16();
     let height = src.read_u16();
-    let bitmap_data_byte_count: usize = cast_length!("bitmapDataByteCount", src.read_u32())?;
+    let bitmap_data_byte_count: usize = cast_length!("bitmapDataByteCount", src.read_u32(), in: src)?;
     let codec_id_raw = src.read_u8();
     let codec_id = SubcodecId::from_u8(codec_id_raw)?;
 
     if width == 0 || height == 0 {
-        return Err(invalid_field_err!("dimensions", "subcodec region has zero dimension"));
+        return Err(invalid_field_err!("dimensions", "subcodec region has zero dimension", in: src));
     }
 
     ensure_size!(ctx: Subcodec::NAME, in: src, size: bitmap_data_byte_count);
@@ -155,15 +155,18 @@ mod tests {
         data.push(0x00); // Raw
         data.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
 
-        // Second region: 1x1 RLEX (minimal: palette_count=1 + run)
+        // Second region: 1x1 RLEX (minimal: palette_count=1 + one segment).
+        // Even with a single palette entry, a segment keeps its packed byte
+        // (stopIndex on one bit, suiteDepth on seven) before the run length.
         data.extend_from_slice(&5u16.to_le_bytes());
         data.extend_from_slice(&5u16.to_le_bytes());
         data.extend_from_slice(&1u16.to_le_bytes());
         data.extend_from_slice(&1u16.to_le_bytes());
-        data.extend_from_slice(&5u32.to_le_bytes());
+        data.extend_from_slice(&6u32.to_le_bytes());
         data.push(0x02); // RLEX
         data.push(1); // palette_count
         data.extend_from_slice(&[0x00, 0x00, 0x00]); // palette entry
+        data.push(0x00); // packed byte: stop_index=0, suite_depth=0
         data.push(1); // run_length
 
         let regions = decode_subcodec_layer(&data).unwrap();

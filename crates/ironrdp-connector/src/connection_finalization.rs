@@ -7,7 +7,10 @@ use ironrdp_pdu::rdp::headers::ShareDataPdu;
 use ironrdp_pdu::rdp::{finalization_messages, server_error_info};
 use tracing::{debug, warn};
 
-use crate::{ConnectorResult, Sequence, State, Written, general_err, legacy, reason_err};
+use crate::{
+    ConnectorError, ConnectorErrorExt as _, ConnectorResult, MonotonicInstant, Sequence, State, Written, general_err,
+    reason_err,
+};
 
 #[derive(Default, Debug, Copy, Clone)]
 #[non_exhaustive]
@@ -47,12 +50,13 @@ impl State for ConnectionFinalizationState {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub struct ConnectionFinalizationSequence {
     pub state: ConnectionFinalizationState,
     pub io_channel_id: u16,
     pub user_channel_id: u16,
     pub share_id: u32,
+    pub monitor_layout: Option<finalization_messages::MonitorLayoutPdu>,
 }
 
 impl ConnectionFinalizationSequence {
@@ -62,6 +66,7 @@ impl ConnectionFinalizationSequence {
             io_channel_id,
             user_channel_id,
             share_id,
+            monitor_layout: None,
         }
     }
 }
@@ -83,7 +88,12 @@ impl Sequence for ConnectionFinalizationSequence {
         &self.state
     }
 
-    fn step(&mut self, input: &[u8], output: &mut WriteBuf) -> ConnectorResult<Written> {
+    fn step(
+        &mut self,
+        input: &[u8],
+        _received_at: Option<MonotonicInstant>,
+        output: &mut WriteBuf,
+    ) -> ConnectorResult<Written> {
         let (written, next_state) = match mem::take(&mut self.state) {
             ConnectionFinalizationState::Consumed => {
                 return Err(general_err!(
@@ -98,13 +108,14 @@ impl Sequence for ConnectionFinalizationSequence {
 
                 debug!(?message, "Send");
 
-                let written = legacy::encode_share_data(
+                let written = ironrdp_pdu::rdp::headers::encode_share_data(
                     self.user_channel_id,
                     self.io_channel_id,
                     self.share_id,
                     message,
                     output,
-                )?;
+                )
+                .map_err(ConnectorError::encode)?;
 
                 (
                     Written::from_size(written)?,
@@ -121,13 +132,14 @@ impl Sequence for ConnectionFinalizationSequence {
 
                 debug!(?message, "Send");
 
-                let written = legacy::encode_share_data(
+                let written = ironrdp_pdu::rdp::headers::encode_share_data(
                     self.user_channel_id,
                     self.io_channel_id,
                     self.share_id,
                     message,
                     output,
-                )?;
+                )
+                .map_err(ConnectorError::encode)?;
 
                 (
                     Written::from_size(written)?,
@@ -144,13 +156,14 @@ impl Sequence for ConnectionFinalizationSequence {
 
                 debug!(?message, "Send");
 
-                let written = legacy::encode_share_data(
+                let written = ironrdp_pdu::rdp::headers::encode_share_data(
                     self.user_channel_id,
                     self.io_channel_id,
                     self.share_id,
                     message,
                     output,
-                )?;
+                )
+                .map_err(ConnectorError::encode)?;
 
                 (Written::from_size(written)?, ConnectionFinalizationState::SendFontList)
             }
@@ -160,13 +173,14 @@ impl Sequence for ConnectionFinalizationSequence {
 
                 debug!(?message, "Send");
 
-                let written = legacy::encode_share_data(
+                let written = ironrdp_pdu::rdp::headers::encode_share_data(
                     self.user_channel_id,
                     self.io_channel_id,
                     self.share_id,
                     message,
                     output,
-                )?;
+                )
+                .map_err(ConnectorError::encode)?;
 
                 (
                     Written::from_size(written)?,
@@ -175,8 +189,8 @@ impl Sequence for ConnectionFinalizationSequence {
             }
 
             ConnectionFinalizationState::WaitForResponse => {
-                let ctx = legacy::decode_send_data_indication(input)?;
-                let ctx = legacy::decode_share_data(ctx)?;
+                let ctx = ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
+                let ctx = ironrdp_pdu::rdp::headers::decode_share_data(ctx).map_err(ConnectorError::decode)?;
 
                 debug!(message = ?ctx.pdu, "Received");
 
@@ -238,6 +252,10 @@ impl Sequence for ConnectionFinalizationSequence {
                                 ));
                             }
                         }
+                    }
+                    ShareDataPdu::MonitorLayout(monitor_layout) => {
+                        self.monitor_layout = Some(monitor_layout);
+                        ConnectionFinalizationState::WaitForResponse
                     }
                     ShareDataPdu::FontMap(_) => {
                         // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/023f1e69-cfe8-4ee6-9ee0-7e759fb4e4ee

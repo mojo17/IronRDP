@@ -10,5 +10,9 @@
 #![allow(clippy::cast_sign_loss)]
 
 pub mod app;
+pub mod cli;
 pub mod clipboard;
-pub mod config;
+#[cfg(windows)]
+pub mod drives;
+mod keymap;
+pub mod rail;

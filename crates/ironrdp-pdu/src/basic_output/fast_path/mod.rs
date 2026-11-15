@@ -61,7 +61,7 @@ impl Encode for FastPathHeader {
         dst.write_u8(header);
 
         let length = self.data_length + self.size();
-        let length = cast_length!("length", length)?;
+        let length = cast_length!("length", length, in: dst)?;
 
         if self.forced_long_length {
             // Preserve same layout for header as received
@@ -94,14 +94,12 @@ impl<'de> Decode<'de> for FastPathHeader {
         let flags = EncryptionFlags::from_bits_retain(header.get_bits(6..8));
 
         let (length, sizeof_length) = per::read_length(src).map_err(|e| {
-            DecodeError::invalid_field("", "length", "Invalid encoded fast path PDU length").with_source(e)
+            DecodeError::invalid_field("", "length", "Invalid encoded fast path PDU length", None).with_source(e)
         })?;
         let length = usize::from(length);
         if length < sizeof_length + Self::FIXED_PART_SIZE {
-            return Err(invalid_field_err!(
-                "length",
-                "received fastpath PDU length is smaller than header size"
-            ));
+            return Err(invalid_field_err!( "length",
+                "received fastpath PDU length is smaller than header size", in: src));
         }
         let data_length = length - sizeof_length - Self::FIXED_PART_SIZE;
         // Detect case, when received packet has non-optimal packet length packing.
@@ -136,16 +134,20 @@ impl Encode for FastPathUpdatePdu<'_> {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size());
 
-        let data_len = cast_length!("data length", self.data.len())?;
+        let data_len = cast_length!("data length", self.data.len(), in: dst)?;
 
         let mut header = 0u8;
         header.set_bits(0..4, self.update_code.as_u8());
         header.set_bits(4..6, self.fragmentation.as_u8());
+        if self.compression_flags.is_some() {
+            // The COMPRESSION_USED bit must be set on the header byte before it
+            // is written, so the decoder knows a compression flags byte follows.
+            header.set_bits(6..8, Compression::COMPRESSION_USED.bits());
+        }
 
         dst.write_u8(header);
 
         if self.compression_flags.is_some() {
-            header.set_bits(6..8, Compression::COMPRESSION_USED.bits());
             let compression_flags_with_type =
                 self.compression_flags.map(|f| f.bits()).unwrap_or(0) | self.compression_type.map_or(0, |f| f.as_u8());
             dst.write_u8(compression_flags_with_type);
@@ -176,11 +178,11 @@ impl<'de> Decode<'de> for FastPathUpdatePdu<'de> {
 
         let update_code = header.get_bits(0..4);
         let update_code = UpdateCode::from_u8(update_code)
-            .ok_or_else(|| invalid_field_err!("updateHeader", "Invalid update code"))?;
+            .ok_or_else(|| invalid_field_err!("updateHeader", "Invalid update code", in: src))?;
 
         let fragmentation = header.get_bits(4..6);
         let fragmentation = Fragmentation::from_u8(fragmentation)
-            .ok_or_else(|| invalid_field_err!("updateHeader", "Invalid fragmentation"))?;
+            .ok_or_else(|| invalid_field_err!("updateHeader", "Invalid fragmentation", in: src))?;
 
         let compression = Compression::from_bits_retain(header.get_bits(6..8));
 
@@ -193,7 +195,7 @@ impl<'de> Decode<'de> for FastPathUpdatePdu<'de> {
                 CompressionFlags::from_bits_retain(compression_flags_with_type & !SHARE_DATA_HEADER_COMPRESSION_MASK);
             let compression_type =
                 CompressionType::from_u8(compression_flags_with_type & SHARE_DATA_HEADER_COMPRESSION_MASK)
-                    .ok_or_else(|| invalid_field_err!("compressionFlags", "invalid compression type"))?;
+                    .ok_or_else(|| invalid_field_err!("compressionFlags", "invalid compression type", in: src))?;
 
             (Some(compression_flags), Some(compression_type))
         } else {
@@ -221,6 +223,8 @@ impl<'de> Decode<'de> for FastPathUpdatePdu<'de> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum FastPathUpdate<'a> {
+    /// Raw Fast-Path Orders update data.
+    Orders(&'a [u8]),
     SurfaceCommands(Vec<SurfaceCommand<'a>>),
     Bitmap(BitmapUpdateData<'a>),
     Pointer(PointerUpdateData<'a>),
@@ -240,6 +244,11 @@ impl<'a> FastPathUpdate<'a> {
 
     pub fn decode_cursor_with_code(src: &mut ReadCursor<'a>, code: UpdateCode) -> DecodeResult<Self> {
         match code {
+            UpdateCode::Orders => {
+                let data = src.remaining();
+                src.advance(data.len());
+                Ok(Self::Orders(data))
+            }
             UpdateCode::SurfaceCommands => {
                 let mut commands = Vec::with_capacity(1);
                 while src.len() >= SURFACE_COMMAND_HEADER_SIZE {
@@ -264,12 +273,13 @@ impl<'a> FastPathUpdate<'a> {
             UpdateCode::CachedPointer => Ok(Self::Pointer(PointerUpdateData::Cached(decode_cursor(src)?))),
             UpdateCode::NewPointer => Ok(Self::Pointer(PointerUpdateData::New(decode_cursor(src)?))),
             UpdateCode::LargePointer => Ok(Self::Pointer(PointerUpdateData::Large(decode_cursor(src)?))),
-            _ => Err(invalid_field_err!("updateCode", "unsupported fast-path update code")),
+            _ => Err(invalid_field_err!("updateCode", "unsupported fast-path update code", in: src)),
         }
     }
 
     pub fn as_short_name(&self) -> &str {
         match self {
+            Self::Orders(_) => "Orders",
             Self::SurfaceCommands(_) => "Surface Commands",
             Self::Bitmap(_) => "Bitmap",
             Self::Pointer(_) => "Pointer",
@@ -283,6 +293,9 @@ impl Encode for FastPathUpdate<'_> {
         ensure_size!(in: dst, size: self.size());
 
         match self {
+            Self::Orders(data) => {
+                dst.write_slice(data);
+            }
             Self::SurfaceCommands(commands) => {
                 for command in commands {
                     command.encode(dst)?;
@@ -314,6 +327,7 @@ impl Encode for FastPathUpdate<'_> {
 
     fn size(&self) -> usize {
         match self {
+            Self::Orders(data) => data.len(),
             Self::SurfaceCommands(commands) => commands.iter().map(|c| c.size()).sum::<usize>(),
             Self::Bitmap(bitmap) => bitmap.size(),
             Self::Palette(data) => data.len(),
@@ -361,6 +375,7 @@ impl UpdateCode {
 impl From<&FastPathUpdate<'_>> for UpdateCode {
     fn from(update: &FastPathUpdate<'_>) -> Self {
         match update {
+            FastPathUpdate::Orders(_) => Self::Orders,
             FastPathUpdate::SurfaceCommands(_) => Self::SurfaceCommands,
             FastPathUpdate::Bitmap(_) => Self::Bitmap,
             FastPathUpdate::Palette(_) => Self::Palette,

@@ -1,10 +1,10 @@
 [package]
 name = "ironrdp-core"
-version = "0.2.0"
+version = "0.3.1"
 readme = "README.md"
 description = "IronRDP common traits and types"
 edition.workspace = true
-rust-version = "1.89"
+rust-version = "1.94"
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true

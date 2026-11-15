@@ -5,23 +5,24 @@
 
 use core::net::SocketAddr;
 use core::num::{NonZeroU16, NonZeroUsize};
+use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
 use ironrdp::cliprdr::backend::{CliprdrBackend, CliprdrBackendFactory};
 use ironrdp::connector::DesktopSize;
-use ironrdp::rdpsnd::pdu::{AudioFormat, ClientAudioFormatPdu, WaveFormat};
-use ironrdp::rdpsnd::server::{RdpsndServerHandler, RdpsndServerMessage};
-use ironrdp::server::tokio::sync::mpsc::UnboundedSender;
-use ironrdp::server::tokio::time::{self, Duration, sleep};
+use ironrdp::rdpsnd::pdu::{AudioFormat, WaveFormat};
+use ironrdp::rdpsnd::server::{NegotiatedFormat, RdpsndError, RdpsndServerHandler, RdpsndServerMessage};
 use ironrdp::server::{
-    BitmapUpdate, CliprdrServerFactory, Credentials, DisplayUpdate, KeyboardEvent, MouseEvent, PixelFormat, RdpServer,
-    RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler, ServerEvent, ServerEventSender,
-    SoundServerFactory, TlsIdentityCtx, tokio,
+    BitmapUpdate, CliprdrServerFactory, Credentials, DisplayContext, DisplayUpdate, KeyboardEvent, MouseEvent,
+    PixelFormat, RdpServer, RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler, ServerEvent,
+    ServerEventSender, SoundServerFactory, TlsIdentityCtx,
 };
 use ironrdp_cliprdr_native::StubCliprdrBackend;
 use rand::prelude::*;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::time::{self, Duration, sleep};
 use tracing::{debug, info, warn};
 
 const HELP: &str = "\
@@ -53,7 +54,11 @@ async fn main() -> Result<(), anyhow::Error> {
             pass,
             cert,
             key,
-        } => run(bind_addr, hybrid, user, pass, cert, key).await,
+        } => {
+            // The server's future is large enough to trip clippy::large_futures,
+            // so keep it on the heap rather than in main's stack frame.
+            Box::pin(run(bind_addr, hybrid, user, pass, cert, key)).await
+        }
     }
 }
 
@@ -153,7 +158,7 @@ struct DisplayUpdates;
 
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for DisplayUpdates {
-    async fn next_update(&mut self) -> anyhow::Result<Option<DisplayUpdate>> {
+    async fn next_update(&mut self) -> ironrdp::server::ServerResult<Option<DisplayUpdate>> {
         sleep(Duration::from_millis(100)).await;
         let mut rng = rand::rng();
 
@@ -205,7 +210,7 @@ impl RdpServerDisplay for Handler {
         }
     }
 
-    async fn updates(&mut self) -> anyhow::Result<Box<dyn RdpServerDisplayUpdates>> {
+    async fn updates(&mut self, _: DisplayContext) -> ironrdp::server::ServerResult<Box<dyn RdpServerDisplayUpdates>> {
         Ok(Box::new(DisplayUpdates {}))
     }
 }
@@ -255,17 +260,6 @@ struct SndHandler {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
-impl SndHandler {
-    fn choose_format(&self, client_formats: &[AudioFormat]) -> Option<u16> {
-        for (n, fmt) in client_formats.iter().enumerate() {
-            if self.get_formats().contains(fmt) {
-                return u16::try_from(n).ok();
-            }
-        }
-        None
-    }
-}
-
 impl RdpsndServerHandler for SndHandler {
     fn get_formats(&self) -> &[AudioFormat] {
         &[
@@ -290,30 +284,32 @@ impl RdpsndServerHandler for SndHandler {
         ]
     }
 
-    fn start(&mut self, client_format: &ClientAudioFormatPdu) -> Option<u16> {
-        debug!(?client_format);
+    fn choose_format<'a>(&mut self, common: &'a [NegotiatedFormat]) -> Option<&'a NegotiatedFormat> {
+        debug!(?common);
 
-        let Some(nfmt) = self.choose_format(&client_format.formats) else {
-            return Some(0);
-        };
+        // The crate hands us the formats common to both peers in our preference
+        // order; take the most-preferred one.
+        common.first()
+    }
 
-        let fmt = client_format.formats[usize::from(nfmt)].clone();
+    fn start(&mut self, format: &NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
+        let fmt = format.format().clone();
 
         let mut opus_enc = if fmt.format == WaveFormat::OPUS {
             let n_channels: opus2::Channels = match fmt.n_channels {
                 1 => opus2::Channels::Mono,
                 2 => opus2::Channels::Stereo,
-                n => {
-                    warn!("Invalid OPUS channels: {}", n);
-                    return Some(0);
-                }
+                // Init failure: decline the format instead of leaving the channel
+                // negotiated-but-silent (the crate logs the error and skips audio).
+                n => return Err(Box::new(io::Error::other(format!("invalid OPUS channels: {n}")))),
             };
 
             match opus2::Encoder::new(fmt.n_samples_per_sec, n_channels, opus2::Application::Audio) {
                 Ok(enc) => Some(enc),
                 Err(err) => {
-                    warn!("Failed to create OPUS encoder: {}", err);
-                    return Some(0);
+                    return Err(Box::new(io::Error::other(format!(
+                        "failed to create OPUS encoder: {err}"
+                    ))));
                 }
             }
         } else {
@@ -349,7 +345,7 @@ impl RdpsndServerHandler for SndHandler {
             }
         }));
 
-        Some(nfmt)
+        Ok(())
     }
 
     fn stop(&mut self) {
@@ -437,5 +433,5 @@ async fn run(
         domain: None,
     }));
 
-    server.run().await
+    Ok(server.run().await?)
 }

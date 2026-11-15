@@ -143,7 +143,7 @@ impl UnframedString {
     pub fn decode(src: &mut ReadCursor<'_>, wchar_count: usize) -> DecodeResult<Self> {
         let byte_count = wchar_count
             .checked_mul(2)
-            .ok_or_else(|| invalid_field_err!("wchar_count", "character count overflow"))?;
+            .ok_or_else(|| invalid_field_err!("wchar_count", "character count overflow", in: src))?;
         ensure_size!(in: src, size: byte_count);
 
         let slice = src.read_slice(byte_count);
@@ -156,8 +156,12 @@ impl UnframedString {
     /// Returns a `DecodeError` if `byte_len` is odd (UTF-16LE is always 2 bytes per code unit).
     /// Otherwise equivalent to `decode(src, byte_len / 2)`.
     pub fn decode_from_byte_len(src: &mut ReadCursor<'_>, byte_len: usize) -> DecodeResult<Self> {
-        if byte_len % 2 != 0 {
-            return Err(invalid_field_err!("byte_len", "odd byte count for utf-16 string field"));
+        if !byte_len.is_multiple_of(2) {
+            return Err(invalid_field_err!(
+                "byte_len",
+                "odd byte count for utf-16 string field",
+                in: src
+            ));
         }
         Self::decode(src, byte_len / 2)
     }

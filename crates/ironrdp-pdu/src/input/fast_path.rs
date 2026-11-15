@@ -38,7 +38,7 @@ impl Encode for FastPathInputHeader {
         header.set_bits(6..8, self.flags.bits());
         dst.write_u8(header);
 
-        per::write_length(dst, cast_length!("len", self.data_length + self.size())?);
+        per::write_length(dst, cast_length!("len", self.data_length + self.size(), in: dst)?);
         if self.num_events > 15 {
             dst.write_u8(self.num_events);
         }
@@ -66,7 +66,7 @@ impl<'de> Decode<'de> for FastPathInputHeader {
         let (length, sizeof_length) = per::read_length(src).map_err(|e| other_err!("perLen", source: e))?;
 
         if !flags.is_empty() {
-            return Err(invalid_field_err!("flags", "encryption not supported"));
+            return Err(invalid_field_err!("flags", "encryption not supported", in: src));
         }
 
         let num_events_length = if num_events == 0 {
@@ -158,10 +158,14 @@ impl Encode for FastPathInputEvent {
             FastPathInputEvent::MouseEventEx(pdu) => {
                 pdu.encode(dst)?;
             }
+            FastPathInputEvent::MouseEventRel(pdu) => {
+                pdu.encode(dst)?;
+            }
             FastPathInputEvent::QoeEvent(stamp) => {
                 dst.write_u32(*stamp);
             }
-            _ => {}
+            // The flags live in the event header.
+            FastPathInputEvent::SyncEvent(_) => {}
         };
 
         Ok(())
@@ -193,13 +197,18 @@ impl<'de> Decode<'de> for FastPathInputEvent {
         let flags = header.get_bits(0..5);
         let code = header.get_bits(5..8);
         let code: FastpathInputEventType = FastpathInputEventType::from_u8(code)
-            .ok_or_else(|| invalid_field_err!("code", "input event code unsupported"))?;
+            .ok_or_else(|| invalid_field_err!("code", "input event code unsupported", in: src))?;
         let event = match code {
             FastpathInputEventType::ScanCode => {
                 ensure_size!(in: src, size: 1);
                 let code = src.read_u8();
-                let flags = KeyboardFlags::from_bits(flags)
-                    .ok_or_else(|| invalid_field_err!("flags", "input keyboard flags unsupported"))?;
+                // Retain unknown eventFlags bits (crate-wide policy since
+                // #1144): the slow-path decoder for the same keystroke
+                // already does (scan_code.rs), and a rejection here is
+                // session-fatal mid-use. [MS-RDPBCGR] 3.3.5.8.2's SHOULD-drop
+                // covers unknown event TYPES, which stays enforced above,
+                // not unknown flag bits.
+                let flags = KeyboardFlags::from_bits_retain(flags);
                 FastPathInputEvent::KeyboardEvent(flags, code)
             }
             FastpathInputEventType::Mouse => {
@@ -215,15 +224,16 @@ impl<'de> Decode<'de> for FastPathInputEvent {
                 FastPathInputEvent::MouseEventRel(mouse_event)
             }
             FastpathInputEventType::Sync => {
-                let flags = SynchronizeFlags::from_bits(flags)
-                    .ok_or_else(|| invalid_field_err!("flags", "input synchronize flags unsupported"))?;
+                // Same rationale as ScanCode above; the slow-path sync
+                // decoder (sync.rs) already retains unknown toggle bits.
+                let flags = SynchronizeFlags::from_bits_retain(flags);
                 FastPathInputEvent::SyncEvent(flags)
             }
             FastpathInputEventType::Unicode => {
                 ensure_size!(in: src, size: 2);
                 let code = src.read_u16();
-                let flags = KeyboardFlags::from_bits(flags)
-                    .ok_or_else(|| invalid_field_err!("flags", "input keyboard flags unsupported"))?;
+                // Same rationale as ScanCode above.
+                let flags = KeyboardFlags::from_bits_retain(flags);
                 FastPathInputEvent::UnicodeKeyboardEvent(flags, code)
             }
             FastpathInputEventType::QoeTimestamp => {
@@ -259,7 +269,7 @@ bitflags! {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FastPathInput(
-    /// INVARIANT: (1..=255).contains(len()) = at least one, and at most 255 elements.
+    /// INVARIANT: the input event count is within `1..=FastPathInput::MAX_EVENTS`.
     Vec<FastPathInputEvent>,
 );
 
@@ -269,7 +279,7 @@ pub struct FastPathInput(
 #[cfg(feature = "arbitrary")]
 impl<'a> arbitrary::Arbitrary<'a> for FastPathInput {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        let len = u.int_in_range::<usize>(1..=255)?;
+        let len = u.int_in_range::<usize>(1..=Self::MAX_EVENTS)?;
         let mut events = Vec::with_capacity(len);
         for _ in 0..len {
             events.push(FastPathInputEvent::arbitrary(u)?);
@@ -281,9 +291,11 @@ impl<'a> arbitrary::Arbitrary<'a> for FastPathInput {
 impl FastPathInput {
     const NAME: &'static str = "FastPathInput";
 
+    pub const MAX_EVENTS: usize = 255;
+
     pub fn new(input_events: Vec<FastPathInputEvent>) -> DecodeResult<Self> {
         // Ensure the invariant on `input_events.len()` is respected.
-        if !(1..=255usize).contains(&input_events.len()) {
+        if !(1..=Self::MAX_EVENTS).contains(&input_events.len()) {
             return Err(invalid_field_err!("nEvents", "invalid number of input events"));
         }
 
@@ -310,7 +322,8 @@ impl Encode for FastPathInput {
 
         let data_length = self.0.iter().map(Encode::size).sum::<usize>();
         let header = FastPathInputHeader {
-            num_events: u8::try_from(self.0.len()).expect("per invariant (1..=255).contains(num_events.len())"),
+            num_events: u8::try_from(self.0.len())
+                .expect("per invariant (1..=FastPathInput::MAX_EVENTS).contains(num_events.len())"),
             flags: EncryptionFlags::empty(),
             data_length,
         };
@@ -331,7 +344,7 @@ impl Encode for FastPathInput {
         let data_length = self.0.iter().map(Encode::size).sum::<usize>();
         let header = FastPathInputHeader {
             num_events: u8::try_from(self.0.len())
-                .expect("INVARIANT: num_events is within the range of 1 to 255, inclusive"),
+                .expect("INVARIANT: num_events is within 1..=FastPathInput::MAX_EVENTS"),
             flags: EncryptionFlags::empty(),
             data_length,
         };

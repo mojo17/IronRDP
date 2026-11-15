@@ -6,6 +6,76 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [[0.9.0](https://github.com/Devolutions/IronRDP/compare/ironrdp-cliprdr-v0.8.0...ironrdp-cliprdr-v0.9.0)] - 2026-10-27
+
+### <!-- 7 -->Build
+
+- [**breaking**] Update `ironrdp-pdu` public dependency to 0.11
+
+- [**breaking**] Update `ironrdp-svc` public dependency to 0.10
+
+
+
+## [[0.8.0](https://github.com/Devolutions/IronRDP/compare/ironrdp-cliprdr-v0.7.0...ironrdp-cliprdr-v0.8.0)] - 2026-10-23
+
+### <!-- 1 -->Features
+
+- Add the `chunked_fetch` module, whose `ChunkedFetch` state machine fetches a whole remote file through a sequence of file contents requests ([#1742](https://github.com/Devolutions/IronRDP/issues/1742)) ([58bcbaf572](https://github.com/Devolutions/IronRDP/commit/58bcbaf572d1c75c40daec3921ec217a811c25a4))
+
+- Add the `loop_detector` module, whose `LoopDetector` lets a backend detect clipboard content echoed back between the local and remote clipboards ([#1739](https://github.com/Devolutions/IronRDP/issues/1739)) ([4556adcd98](https://github.com/Devolutions/IronRDP/commit/4556adcd985f491bddfef8099638141dce037ff3))
+
+- Add `Cliprdr::is_ready` to tell whether the clipboard channel finished its initialization ([#2179](https://github.com/Devolutions/IronRDP/issues/2179)) ([b9d1400033](https://github.com/Devolutions/IronRDP/commit/b9d140003323f3ae3cd22f91be556e58ed43322e))
+
+- Expose `MAX_LOCKED_FILE_LISTS` so backends keeping per-lock state can use the same bound ([#2179](https://github.com/Devolutions/IronRDP/issues/2179)) ([b9d1400033](https://github.com/Devolutions/IronRDP/commit/b9d140003323f3ae3cd22f91be556e58ed43322e))
+
+### <!-- 4 -->Bug Fixes
+
+- Notify the backend through `on_file_contents_response` with an error response when `Cliprdr::request_file_contents` rejects a request, so the caller waiting on that stream is not left hanging ([#1980](https://github.com/Devolutions/IronRDP/issues/1980)) ([124406d881](https://github.com/Devolutions/IronRDP/commit/124406d881af377cb339e8c131831f69e3cf7e45))
+
+- Match format data responses to requests in the order they were sent, so a second paste or a format list arriving before a response no longer misroutes it, for example parsing text as a file list; once 64 requests are unanswered, `Cliprdr::initiate_paste` fails locally with an error passed to `on_format_data_response` ([#2053](https://github.com/Devolutions/IronRDP/issues/2053)) ([cd5739d129](https://github.com/Devolutions/IronRDP/commit/cd5739d1299aefd22eb38b206cd73222b37bfff4))
+
+- Validate a file contents request carrying a `clipDataId` against the remote file list its lock covers, instead of the current remote file list ([#1981](https://github.com/Devolutions/IronRDP/issues/1981)) ([a765306172](https://github.com/Devolutions/IronRDP/commit/a7653061725cc28df01b155b8e3d104a511df163))
+
+### <!-- 7 -->Build
+
+- Raise the minimum supported Rust version to 1.94 ([#1495](https://github.com/Devolutions/IronRDP/issues/1495)) ([0aeea76e95](https://github.com/Devolutions/IronRDP/commit/0aeea76e95e6b6b590d65be353dd00596d50a895))
+
+- [**breaking**] Update `ironrdp-core` public dependency to 0.3
+
+- [**breaking**] Update `ironrdp-pdu` public dependency to 0.10
+
+- [**breaking**] Update `ironrdp-svc` public dependency to 0.9
+
+
+
+## [[0.7.0](https://github.com/Devolutions/IronRDP/compare/ironrdp-cliprdr-v0.6.0...ironrdp-cliprdr-v0.7.0)] - 2026-07-10
+
+### <!-- 1 -->Features
+
+- Dispatch initiate_file_copy via ClipboardMessage ([#1388](https://github.com/Devolutions/IronRDP/issues/1388)) ([b6325f9ea6](https://github.com/Devolutions/IronRDP/commit/b6325f9ea6900a84643b4415f9ebc7b1010cf3cd)) 
+
+  Extends the CLIPRDR backend-facing API to properly support offering clipboard file lists (so later FileContentsRequests can be serviced) by introducing ClipboardMessage::SendInitiateFileCopy(Vec<FileDescriptor>) and wiring it through the in-tree ClipboardMessage dispatchers.
+
+### <!-- 4 -->Bug Fixes
+
+- Release outgoing locks before initiating a file copy ([#1375](https://github.com/Devolutions/IronRDP/issues/1375)) ([5d534f10a6](https://github.com/Devolutions/IronRDP/commit/5d534f10a6f62ac7a860521b4e95c8c47b754612)) 
+
+- Lower verbosity of routine logs in library crates ([c36032f91b](https://github.com/Devolutions/IronRDP/commit/c36032f91b27390a2cd34bfb300cfbe099d847a9)) 
+
+  Library crates should not emit info! for routine, repeating operations;
+  that floods the default logs of the final consumer, which owns the
+  verbosity decision. Reserve info! for rare connection/session lifecycle
+  milestones, debug! for significant one-off events, and trace! for the
+  fine-grained detail only needed when nothing else explains a problem.
+
+### <!-- 7 -->Build
+
+- [**breaking**] Update `ironrdp-pdu` public dependency to 0.9
+
+- [**breaking**] Update `ironrdp-svc` public dependency to 0.8
+
+
+
 ## [[0.6.0](https://github.com/Devolutions/IronRDP/compare/ironrdp-cliprdr-v0.5.0...ironrdp-cliprdr-v0.6.0)] - 2026-05-27
 
 ### <!-- 1 -->Features

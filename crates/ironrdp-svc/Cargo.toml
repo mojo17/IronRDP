@@ -1,10 +1,10 @@
 [package]
 name = "ironrdp-svc"
-version = "0.7.0"
+version = "0.10.0"
 readme = "README.md"
 description = "IronRDP traits to implement RDP static virtual channels"
 edition.workspace = true
-rust-version = "1.89"
+rust-version = "1.94"
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -21,10 +21,9 @@ default = []
 std = []
 
 [dependencies]
-ironrdp-core = { path = "../ironrdp-core", version = "0.2" } # public
-ironrdp-pdu = { path = "../ironrdp-pdu", version = "0.8", features = ["alloc", "std"] } # public
+ironrdp-core = { path = "../ironrdp-core", version = "0.3" } # public
+ironrdp-pdu = { path = "../ironrdp-pdu", version = "0.11", features = ["alloc", "std"] } # public
 bitflags = "2.11"
 
 [lints]
 workspace = true
-

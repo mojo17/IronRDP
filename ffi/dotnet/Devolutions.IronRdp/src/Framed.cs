@@ -6,7 +6,7 @@ public class Framed<TS> where TS : Stream
 {
     private readonly TS _stream;
     private List<byte> _buffer;
-    private readonly Mutex _writeLock = new();
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
 
     public Framed(TS stream)
     {
@@ -28,8 +28,8 @@ public class Framed<TS> where TS : Stream
             // Don't remove, FindSize is generated and can return null
             if (null != pduInfo)
             {
-                var frame = await this.ReadExact(pduInfo.GetLength());
-                var action = pduInfo.GetAction();
+                var frame = await this.ReadExact(pduInfo.Length);
+                var action = pduInfo.Action;
                 return (action, frame);
             }
             else
@@ -88,7 +88,7 @@ public class Framed<TS> where TS : Stream
 
     public async Task Write(byte[] data)
     {
-        _writeLock.WaitOne();
+        await _writeLock.WaitAsync();
         try
         {
             ReadOnlyMemory<byte> memory = data;
@@ -96,14 +96,14 @@ public class Framed<TS> where TS : Stream
         }
         finally
         {
-            _writeLock.ReleaseMutex();
+            _writeLock.Release();
         }
     }
 
     public async Task Write(WriteBuf buf)
     {
-        var vecU8 = buf.GetFilled();
-        var size = vecU8.GetSize();
+        var vecU8 = buf.Filled;
+        var size = vecU8.Size;
         var bytesArray = new byte[size];
         vecU8.Fill(bytesArray);
         await Write(bytesArray);

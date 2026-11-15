@@ -45,7 +45,7 @@ impl From<ConnectorError> for Box<ffi::IronRdpError> {
             ironrdp::connector::ConnectorErrorKind::AccessDenied => IronRdpErrorKind::AccessDenied,
             _ => IronRdpErrorKind::Generic,
         };
-        let repr = value.report().to_string();
+        let repr = value.report().with_locations().to_string();
         make_ffi_error(repr, kind)
     }
 }
@@ -58,28 +58,28 @@ impl From<SessionError> for Box<ffi::IronRdpError> {
             ironrdp::session::SessionErrorKind::Decode(_) => IronRdpErrorKind::DecodeError,
             _ => IronRdpErrorKind::Generic,
         };
-        let repr = value.report().to_string();
+        let repr = value.report().with_locations().to_string();
         make_ffi_error(repr, kind)
     }
 }
 
 impl From<ironrdp::pdu::PduError> for Box<ffi::IronRdpError> {
     fn from(value: ironrdp::pdu::PduError) -> Self {
-        let repr = value.report().to_string();
+        let repr = value.report().with_locations().to_string();
         make_ffi_error(repr, IronRdpErrorKind::PduError)
     }
 }
 
 impl From<ironrdp::core::EncodeError> for Box<ffi::IronRdpError> {
     fn from(value: ironrdp::core::EncodeError) -> Self {
-        let repr = value.report().to_string();
+        let repr = value.report().with_locations().to_string();
         make_ffi_error(repr, IronRdpErrorKind::EncodeError)
     }
 }
 
 impl From<ironrdp::core::DecodeError> for Box<ffi::IronRdpError> {
     fn from(value: ironrdp::core::DecodeError) -> Self {
-        let repr = value.report().to_string();
+        let repr = value.report().with_locations().to_string();
         make_ffi_error(repr, IronRdpErrorKind::DecodeError)
     }
 }
@@ -184,9 +184,9 @@ impl From<WrongOSError> for Box<ffi::IronRdpError> {
 pub mod ffi {
     use core::fmt::Write as _;
 
-    use diplomat_runtime::DiplomatWriteable;
+    use diplomat_runtime::DiplomatWrite;
 
-    #[derive(Debug, Clone, Copy, thiserror::Error)]
+    #[derive(Debug, thiserror::Error)]
     pub enum IronRdpErrorKind {
         #[error("Generic error")]
         Generic,
@@ -218,12 +218,13 @@ pub mod ffi {
 
     impl IronRdpError {
         /// Returns the error as a string.
-        pub fn to_display(&self, writeable: &mut DiplomatWriteable) {
+        pub fn to_display(&self, writeable: &mut DiplomatWrite) {
             let _ = write!(writeable, "{}", self.0.repr);
             writeable.flush();
         }
 
         /// Returns the error kind.
+        #[diplomat::attr(auto, getter = "kind")]
         pub fn get_kind(&self) -> IronRdpErrorKind {
             self.0.kind
         }

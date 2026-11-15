@@ -43,6 +43,13 @@ pub enum ClipboardMessage {
     /// Implementation should send file contents response on `CLIPRDR` SVC when received.
     SendFileContentsResponse(FileContentsResponse<'static>),
 
+    /// Sent by clipboard backend when a local file list is ready to be offered to the remote.
+    ///
+    /// Implementation should initiate a file copy on `CLIPRDR` SVC when this message is
+    /// received. Unlike [`ClipboardMessage::SendInitiateCopy`], this records the file list so
+    /// later `FileContentsRequest`s from the remote can be serviced.
+    SendInitiateFileCopy(Vec<FileDescriptor>),
+
     /// Failure received from the OS clipboard event loop.
     ///
     /// Client implementation should log/display this error.
@@ -150,6 +157,13 @@ pub trait CliprdrBackend: AsAny + core::fmt::Debug + Send {
     /// previously sent file contents request.
     ///
     /// If data is not available anymore, then server will send error response instead.
+    ///
+    /// [crate::Cliprdr] also synthesizes an error response locally, without the remote being
+    /// involved, whenever a transfer can no longer complete: a request it rejects during
+    /// validation, a request still pending when the peer fails a format list, and a request that
+    /// outlives the transfer timeout. Implementors should therefore treat this method as the
+    /// single place a stream id is retired, and fail whatever awaits that stream instead of
+    /// assuming the remote answered.
     fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>);
 
     /// Processes incoming Lock PDU from the server.

@@ -1,10 +1,10 @@
 [package]
 name = "iron-remote-desktop"
-version = "0.7.1"
+version = "0.8.1"
 readme = "README.md"
 description = "Helper crate for building WASM modules compatible with iron-remote-desktop WebComponent"
 edition.workspace = true
-rust-version = "1.89"
+rust-version = "1.94"
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true

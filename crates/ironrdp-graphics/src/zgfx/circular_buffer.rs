@@ -15,6 +15,20 @@ impl FixedCircularBuffer {
     }
 
     pub(crate) fn read_with_offset(&self, offset: usize, length: usize, output: &mut impl io::Write) -> io::Result<()> {
+        // Defence-in-depth: callers should already have bounded the offset against the
+        // buffer size, but reject out-of-range values here so a stray attacker-controlled
+        // offset surfaces as a typed I/O error rather than an unsigned-underflow panic
+        // in the position calculation below.
+        if offset > self.buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "circular buffer offset {offset} exceeds buffer size {}",
+                    self.buffer.len()
+                ),
+            ));
+        }
+
         let position = (self.buffer.len() + self.position - offset) % self.buffer.len();
 
         // will take the offset if the destination length is greater than the offset,
@@ -44,6 +58,15 @@ impl FixedCircularBuffer {
         }
 
         Ok(())
+    }
+
+    /// The byte `distance` positions before the write position.
+    ///
+    /// INVARIANT: `0 < distance <= self.buffer.len()`. The callers are the compressor's history,
+    /// which only asks for positions it computed itself, so this is checked in debug builds only.
+    pub(crate) fn byte_back(&self, distance: usize) -> u8 {
+        debug_assert!(0 < distance && distance <= self.buffer.len());
+        self.buffer[(self.position + self.buffer.len() - distance) % self.buffer.len()]
     }
 }
 

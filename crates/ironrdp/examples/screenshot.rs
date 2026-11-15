@@ -26,10 +26,10 @@ use anyhow::Context as _;
 use connector::Credentials;
 use ironrdp::connector;
 use ironrdp::connector::ConnectionResult;
-use ironrdp::pdu::gcc::KeyboardType;
+use ironrdp::pdu::gcc::{ConnectionType, KeyboardType};
 use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{ActiveStage, ActiveStageOutput};
+use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput};
 use ironrdp_pdu::rdp::client_info::{CompressionType, PerformanceFlags, TimezoneInfo};
 use sspi::network_client::reqwest_network_client::ReqwestNetworkClient;
 use tokio_rustls::rustls;
@@ -224,16 +224,19 @@ fn build_config(
         domain,
         enable_tls: false, // This example does not expose any frontend.
         enable_credssp: true,
-        keyboard_type: KeyboardType::IbmEnhanced,
+        enable_standard_rdp_security: false,
+        keyboard_type: KeyboardType::IBM_ENHANCED,
         keyboard_subtype: 0,
         keyboard_layout: 0,
         keyboard_functional_keys_count: 12,
+        connection_type: ConnectionType::Lan,
         ime_file_name: String::new(),
         dig_product_id: String::new(),
         desktop_size: connector::DesktopSize {
             width: 1280,
             height: 1024,
         },
+        monitor_layout: None,
         bitmap: None,
         client_build: 0,
         client_name: "ironrdp-screenshot-example".to_owned(),
@@ -262,16 +265,25 @@ fn build_config(
         request_data: None,
         autologon: false,
         enable_audio_playback: false,
+        enable_audio_capture: false,
         compression_type,
         pointer_software_rendering: true,
         multitransport_flags: None,
+        support_dyn_vc_gfx_protocol: false,
         performance_flags: PerformanceFlags::default(),
         desktop_scale_factor: 0,
+        desktop_physical_size: None,
+        desktop_orientation: None,
+        device_scale_factor: None,
+        monitor_extended_layout: None,
+        relative_mouse_input: false,
         hardware_id: None,
         license_cache: None,
         timezone_info: TimezoneInfo::default(),
         alternate_shell: String::new(),
         work_dir: String::new(),
+        remote_application_mode: false,
+        rail_support_level: ironrdp_pdu::rdp::capability_sets::RailSupportLevel::empty(),
     })
 }
 
@@ -334,6 +346,7 @@ fn connect(
         server_public_key,
         None,
     )
+    .and_then(connector::ConnectionOutcome::into_connected)
     .context("finalize connection")?;
 
     Ok((connection_result, upgraded_framed))
@@ -344,7 +357,17 @@ fn active_stage(
     mut framed: UpgradedFramed,
     image: &mut DecodedImage,
 ) -> anyhow::Result<()> {
-    let mut active_stage = ActiveStage::new(connection_result);
+    let mut active_stage = ActiveStageBuilder {
+        static_channels: connection_result.static_channels,
+        user_channel_id: connection_result.user_channel_id,
+        io_channel_id: connection_result.io_channel_id,
+        message_channel_id: connection_result.message_channel_id,
+        share_id: connection_result.share_id,
+        compression_type: connection_result.compression_type,
+        enable_server_pointer: connection_result.enable_server_pointer,
+        pointer_software_rendering: connection_result.pointer_software_rendering,
+    }
+    .build();
 
     'outer: loop {
         let (action, payload) = match framed.read_pdu() {
@@ -355,7 +378,7 @@ fn active_stage(
 
         trace!(?action, frame_length = payload.len(), "Frame received");
 
-        let outputs = active_stage.process(image, action, &payload)?;
+        let outputs = active_stage.process(image, action, &payload, framed.last_read_at())?;
 
         for out in outputs {
             match out {
@@ -425,11 +448,11 @@ fn extract_tls_server_public_key(cert: &[u8]) -> anyhow::Result<Vec<u8>> {
 
     let cert = x509_cert::Certificate::from_der(cert)?;
 
-    debug!(%cert.tbs_certificate.subject);
+    debug!(subject = %cert.tbs_certificate().subject());
 
     let server_public_key = cert
-        .tbs_certificate
-        .subject_public_key_info
+        .tbs_certificate()
+        .subject_public_key_info()
         .subject_public_key
         .as_bytes()
         .context("subject public key BIT STRING is not aligned")?

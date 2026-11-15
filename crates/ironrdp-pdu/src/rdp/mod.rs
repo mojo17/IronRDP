@@ -10,10 +10,13 @@ pub mod capability_sets;
 pub mod client_info;
 pub mod finalization_messages;
 pub mod headers;
+pub mod heartbeat;
+pub mod message_channel;
 pub mod multitransport;
 pub mod refresh_rectangle;
 pub mod server_error_info;
 pub mod server_license;
+pub mod server_redirection;
 pub mod session_info;
 pub mod suppress_output;
 pub mod vc;
@@ -56,7 +59,7 @@ impl<'de> Decode<'de> for ClientInfoPdu {
 
         let security_header = BasicSecurityHeader::decode(src)?;
         if !security_header.flags.contains(BasicSecurityHeaderFlags::INFO_PKT) {
-            return Err(invalid_field_err!("securityHeader", "got invalid security header"));
+            return Err(invalid_field_err!("securityHeader", "got invalid security header", in: src));
         }
 
         let client_info = ClientInfo::decode(src)?;

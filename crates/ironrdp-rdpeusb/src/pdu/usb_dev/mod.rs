@@ -11,11 +11,12 @@ use ironrdp_core::{
     Decode as _, DecodeOwned as _, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, ensure_fixed_part_size,
     ensure_size, invalid_field_err, other_err, unsupported_value_err,
 };
+use ironrdp_dvc::DvcEncode;
 use ironrdp_str::prefixed::Cch32String;
 
 use crate::pdu::header::{FunctionId, InterfaceId, Mask, MessageId, SharedMsgHeader};
-use crate::pdu::usb_dev::ts_urb::{TsUrbIn, TsUrbOut};
-use crate::pdu::utils::{HResult, RequestId, RequestIdIoctl};
+use crate::pdu::usb_dev::ts_urb::{TsUrbIn, TsUrbInKind, TsUrbOut};
+use crate::pdu::utils::{HResult, RequestId, RequestIdIoctl, RequestIdTransferInOut};
 #[cfg(doc)]
 use crate::pdu::{
     completion::{IoControlCompletion, UrbCompletion, UrbCompletionNoData},
@@ -79,6 +80,8 @@ impl Encode for CancelRequest {
     }
 }
 
+impl DvcEncode for CancelRequest {}
+
 /// [\[MS-RDPEUSB\] 2.2.6.2 Register Request Callback Message (REGISTER_REQUEST_CALLBACK)][1] message.
 ///
 /// Sent from the server to the client in order to provide an interface ID for Request Completion
@@ -108,16 +111,10 @@ impl RegisterRequestCallback {
         let request_completion = match src.read_u32() {
             0x0 => None,
             _ => {
+                // The server allocates this ID in its own interface space and only uses it to
+                // receive completions, so any value is valid: Windows Server picks one below 4.
                 ensure_size!(in: src, size: InterfaceId::FIXED_PART_SIZE);
-                match src.read_u32() {
-                    0x0..=0x3 => {
-                        return Err(invalid_field_err!(
-                            "RequestCompletion",
-                            "conflict with default interfaces"
-                        ));
-                    }
-                    value => Some(InterfaceId::try_from(value)?),
-                }
+                Some(InterfaceId::try_from(src.read_u32())?)
             }
         };
         Ok(Self {
@@ -151,6 +148,8 @@ impl Encode for RegisterRequestCallback {
         SharedMsgHeader::SIZE_REQ + 4 + request_completion_size
     }
 }
+
+impl DvcEncode for RegisterRequestCallback {}
 
 /// [\[MS-RDPEUSB\] 2.2.6.3 IO Control Message (IO_CONTROL)][1] message.
 ///
@@ -219,13 +218,14 @@ impl IoControl {
             0x220_020 => IoctlInternalUsb::GetHubName,
             0x220_420 => IoctlInternalUsb::GetBusInfo,
             0x220_424 => IoctlInternalUsb::GetControllerName,
-            value => return Err(unsupported_value_err!("IoControlCode", format!("{value}"))),
+            value => return Err(unsupported_value_err!("IoControlCode", format!("{value}"), in: src)),
         };
         let input_buffer_size = src.read_u32().try_into().map_err(|e| other_err!(source: e))?;
         ensure_size!(in: src,
-            size: input_buffer_size /* InputBuffer */ + 4 /* OutputBufferSize */ + 4 /* RequestId */);
+            size: input_buffer_size);
         // TODO: size limit
         let input_buffer = src.read_slice(input_buffer_size).to_vec();
+        ensure_size!(in: src, size: 4 /*output buffer size */ + 4 /* request id */);
         let output_buffer_size = src.read_u32();
         let req_id = src.read_u32();
         let io_control = Self {
@@ -240,14 +240,14 @@ impl IoControl {
         io_control
             .check_output_buffer_size()
             .map(|()| io_control)
-            .map_err(|reason| invalid_field_err!("IO_CONTROL::OutputBufferSize", reason))
+            .map_err(|reason| invalid_field_err!("IO_CONTROL::OutputBufferSize", reason, in: src))
     }
 }
 
 impl Encode for IoControl {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         self.check_output_buffer_size()
-            .map_err(|reason| invalid_field_err!("IO_CONTROL::OutputBufferSize", reason))?;
+            .map_err(|reason| invalid_field_err!("IO_CONTROL::OutputBufferSize", reason, in: dst))?;
         ensure_size!(in: dst, size: self.size());
         self.header().encode(dst)?;
 
@@ -271,6 +271,8 @@ impl Encode for IoControl {
         SharedMsgHeader::SIZE_REQ + Self::PAYLOAD_MIN_SIZE + self.input_buffer.len()
     }
 }
+
+impl DvcEncode for IoControl {}
 
 /// [\[MS-RDPEUSB\] 2.2.12 USB IO Control Code][1]s.
 ///
@@ -367,11 +369,11 @@ impl IoctlInternalUsb {
 /// [\[MS-RDPEUSB\] 2.2.13 USB Internal IO Control Code][1].
 ///
 /// [1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpeusb/55d1cd44-eda3-4cba-931c-c3cb8b3c3c92
-#[repr(u32)]
-#[non_exhaustive]
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 #[doc(alias = "IOCTL_TSUSBGD_IOCTL_USBDI_QUERY_BUS_TIME")]
-pub enum UsbInternalIoctlCode {
+pub struct UsbInternalIoctlCode(pub u32);
+
+impl UsbInternalIoctlCode {
     /// [\[MS-RDPEUSB\] 2.2.13.1 IOCTL_TSUSBGD_IOCTL_USBDI_QUERY_BUS_TIME][1].
     ///
     /// Sent when the server receives a request its system to query the device's current frame
@@ -382,10 +384,8 @@ pub enum UsbInternalIoctlCode {
     ///
     /// [1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpeusb/68506bc9-fedc-4fc1-b826-3cdbb1988774
     #[doc(alias = "IOCTL_TSUSBGD_IOCTL_USBDI_QUERY_BUS_TIME")]
-    IoctlTsusbgdIoctlUsbdiQueryBusTime = 0x00224000,
+    pub const QUERY_BUS_TIME: Self = Self(0x00224000);
 }
-
-const IOCTL_TSUSBGD_IOCTL_USBDI_QUERY_BUS_TIME: u32 = 0x00224000;
 
 /// [\[MS-RDPEUSB\] 2.2.6.4 Internal IO Control Message (INTERNAL_IO_CONTROL)][1] message.
 ///
@@ -397,27 +397,17 @@ const IOCTL_TSUSBGD_IOCTL_USBDI_QUERY_BUS_TIME: u32 = 0x00224000;
 pub struct InternalIoControl {
     pub msg_id: MessageId,
     pub udev_iface: InterfaceId,
-    // Should make adding new codes easier.
     pub ioctl_code: UsbInternalIoctlCode,
-    /// As of **v20240423**, all codes used for this message require sending an empty input buffer.
-    ///
-    /// * [MS-RDPEUSB 2.2.13 USB Internal IO Control Code][1]
-    ///
-    /// [1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpeusb/55d1cd44-eda3-4cba-931c-c3cb8b3c3c92
     pub input_buffer: Vec<u8>,
     pub output_buffer_size: u32,
     pub req_id: RequestIdIoctl,
 }
 
 impl InternalIoControl {
-    #[expect(clippy::identity_op, reason = "for developer documentation purposes?")]
-    pub const PAYLOAD_SIZE: usize = 4 // IoControlCode
+    pub const PAYLOAD_MIN_SIZE: usize = 4 // IoControlCode
         + 4 // InputBufferSize
-        + 0 // InputBuffer
         + 4 // OutputBufferSize
         + 4; // RequestId
-
-    pub const FIXED_PART_SIZE: usize = SharedMsgHeader::SIZE_REQ /* Header */ + Self::PAYLOAD_SIZE;
 
     pub fn header(&self) -> SharedMsgHeader {
         SharedMsgHeader {
@@ -428,40 +418,23 @@ impl InternalIoControl {
     }
 
     pub(crate) fn decode(src: &mut ReadCursor<'_>, msg_id: MessageId, udev_iface: InterfaceId) -> DecodeResult<Self> {
-        ensure_size!(in: src, size: Self::PAYLOAD_SIZE);
+        ensure_size!(in: src, size: Self::PAYLOAD_MIN_SIZE);
 
-        {
-            let code = src.read_u32();
-            if code != IOCTL_TSUSBGD_IOCTL_USBDI_QUERY_BUS_TIME {
-                return Err(unsupported_value_err!(
-                    "INTERNAL_IO_CONTROL::IoControlCode",
-                    format!("{code:#X}")
-                ));
-            }
-        }
-        {
-            let size = src.read_u32(/* InputBufferSize */);
-            if size != 0 {
-                return Err(unsupported_value_err!(
-                    "INTERNAL_IO_CONTROL::InputBufferSize",
-                    format!("{size:#X}")
-                ));
-            }
-        }
+        let code = src.read_u32();
+
+        let size = src.read_u32().try_into().map_err(|e| other_err!(source: e))?;
+        ensure_size!(in: src, size: size);
+        let input_buffer = src.read_slice(size).to_vec();
+
+        ensure_size!(in: src, size: 4 /*output buffer size */ + 4 /* request id */);
         let output_buffer_size = src.read_u32(/* OutputBufferSize */);
-        if output_buffer_size != 0x4 {
-            return Err(unsupported_value_err!(
-                "INTERNAL_IO_CONTROL::OutputBufferSize",
-                format!("{output_buffer_size:#X}")
-            ));
-        }
         let req_id = src.read_u32();
 
         Ok(Self {
             msg_id,
             udev_iface,
-            ioctl_code: UsbInternalIoctlCode::IoctlTsusbgdIoctlUsbdiQueryBusTime,
-            input_buffer: Vec::new(),
+            ioctl_code: UsbInternalIoctlCode(code),
+            input_buffer,
             output_buffer_size,
             req_id,
         })
@@ -470,12 +443,12 @@ impl InternalIoControl {
 
 impl Encode for InternalIoControl {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        ensure_fixed_part_size!(in: dst);
-
+        ensure_size!(in: dst, size: self.size());
         self.header().encode(dst)?;
-        dst.write_u32(IOCTL_TSUSBGD_IOCTL_USBDI_QUERY_BUS_TIME); // IoControlCode
-        dst.write_u32(0x0); // InputBufferSize
-        dst.write_u32(0x4); // OutputBufferSize
+        dst.write_u32(self.ioctl_code.0); // IoControlCode
+        dst.write_u32(self.input_buffer.len().try_into().map_err(|e| other_err!(source: e))?); // InputBufferSize
+        dst.write_slice(&self.input_buffer); // InputBuffer
+        dst.write_u32(self.output_buffer_size); // OutputBufferSize
         dst.write_u32(self.req_id);
 
         Ok(())
@@ -486,9 +459,11 @@ impl Encode for InternalIoControl {
     }
 
     fn size(&self) -> usize {
-        Self::FIXED_PART_SIZE
+        SharedMsgHeader::SIZE_REQ + Self::PAYLOAD_MIN_SIZE + self.input_buffer.len()
     }
 }
+
+impl DvcEncode for InternalIoControl {}
 
 /// [\[MS-RDPEUSB\] 2.2.6.5 Query Device Text Message (QUERY_DEVICE_TEXT)][1] message.
 ///
@@ -556,6 +531,8 @@ impl Encode for QueryDeviceText {
     }
 }
 
+impl DvcEncode for QueryDeviceText {}
+
 /// [\[MS-RDPEUSB\] 2.2.6.6 Query Device Text Response Message (QUERY_DEVICE_TEXT_RSP)][1] message.
 ///
 /// Sent from the client in response to a [`QueryDeviceText`] message sent by the server.
@@ -617,23 +594,7 @@ impl Encode for QueryDeviceTextRsp {
     }
 }
 
-// macro_rules! check_output_buffer_size {
-//     ($ts_urb:expr, $output_buffer_size:expr) => {{
-//     }};
-// }
-
-// #[derive(Debug)]
-// pub struct TransferInRequestOutputBufferSizeErr {
-//     is: u32,
-//     expected: u32,
-//     ts_urb: &'static str,
-// }
-//
-// impl core::fmt::Display for TransferInRequestOutputBufferSizeErr {
-//     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-//         write!(f, "")
-//     }
-// }
+impl DvcEncode for QueryDeviceTextRsp {}
 
 /// [\[MS-RDPEUSB\] 2.2.6.7 Transfer In Request (TRANSFER_IN_REQUEST)][1] message.
 ///
@@ -658,10 +619,14 @@ impl TransferInRequest {
         }
     }
 
-    pub fn check_output_buffer_size(&self) -> Result<(), &'static str> {
-        use TsUrbIn::*;
+    pub fn request_id(&self) -> RequestIdTransferInOut {
+        self.ts_urb.header.req_id
+    }
 
-        match self.ts_urb {
+    pub fn check_output_buffer_size(&self) -> Result<(), &'static str> {
+        use TsUrbInKind::*;
+
+        match &self.ts_urb.kind {
             SelectConfig(_) if self.output_buffer_size != 0 => {
                 Err("is not: 0; TRANSFER_IN_REQUEST::TsUrb: TS_URB_SELECT_CONFIGURATION")
             }
@@ -713,7 +678,7 @@ impl TransferInRequest {
 
         transfer_in_req
             .check_output_buffer_size()
-            .map_err(|reason| invalid_field_err!("TRANSFER_IN_REQUEST::OutputBufferSize", reason))?;
+            .map_err(|reason| invalid_field_err!("TRANSFER_IN_REQUEST::OutputBufferSize", reason, in: src))?;
 
         Ok(transfer_in_req)
     }
@@ -722,7 +687,7 @@ impl TransferInRequest {
 impl Encode for TransferInRequest {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         self.check_output_buffer_size()
-            .map_err(|reason| invalid_field_err!("TRANSFER_IN_REQUEST::OutputBufferSize", reason))?;
+            .map_err(|reason| invalid_field_err!("TRANSFER_IN_REQUEST::OutputBufferSize", reason, in: dst))?;
         ensure_size!(in: dst, size: self.size());
 
         self.header().encode(dst)?;
@@ -744,6 +709,8 @@ impl Encode for TransferInRequest {
             + 4 /* OutputBufferSize */
     }
 }
+
+impl DvcEncode for TransferInRequest {}
 
 /// [\[MS-RDPEUSB\] 2.2.6.8 Transfer Out Request (TRANSFER_OUT_REQUEST)][1] message.
 ///
@@ -822,6 +789,8 @@ impl Encode for TransferOutRequest {
     }
 }
 
+impl DvcEncode for TransferOutRequest {}
+
 /// [\[MS-RDPEUSB\] 2.2.6.9 Retract Device (RETRACT_DEVICE)][1] message.
 ///
 /// Sent from the server to the client in order to stop redirecting the USB device.
@@ -854,7 +823,7 @@ impl RetractDevice {
         let reason = src.read_u32();
         #[expect(clippy::as_conversions)]
         if reason != UsbRetractReason::BlockedByPolicy as u32 {
-            return Err(unsupported_value_err!("RETRACT_DEVICE::Reason", format!("{reason}")));
+            return Err(unsupported_value_err!("RETRACT_DEVICE::Reason", format!("{reason}"), in: src));
         }
 
         Ok(Self {
@@ -895,3 +864,5 @@ pub enum UsbRetractReason {
     /// server's (group) policy.
     BlockedByPolicy = 0x1,
 }
+
+impl DvcEncode for RetractDevice {}

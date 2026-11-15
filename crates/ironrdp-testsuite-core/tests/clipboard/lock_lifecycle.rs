@@ -17,7 +17,9 @@ use ironrdp_cliprdr::{Cliprdr, CliprdrClient, CliprdrState};
 use ironrdp_core::Encode as _;
 use ironrdp_svc::{SvcMessage, SvcProcessor as _};
 
-use super::test_helpers::{CallbackTrackingBackend, LockingBackend, TestBackend};
+use ironrdp_testsuite_core::clipboard::{
+    CallbackTrackingBackend, LockingBackend, TestBackend, init_ready_locking_client, set_remote_file_list,
+};
 
 /// Introduce `let` bindings for the encoded bytes and the decoded
 /// [`ClipboardPdu`] in the caller's scope.  Two names are required so
@@ -561,4 +563,181 @@ fn on_outgoing_locks_expired_callback_invoked() {
 
     // Cleared callback should NOT have fired yet (cleanup hasn't run)
     assert!(cleared_ids.lock().unwrap().is_empty());
+}
+
+// -- Taking clipboard ownership releases stale download locks --------
+
+/// When the local side initiates a file copy (an upload), it takes clipboard
+/// ownership — so the outgoing locks placed for downloads from the previous owner are
+/// now stale. They must be released with `Unlock` PDUs that PRECEDE our `FormatList` on
+/// the wire; otherwise the server keeps tracking a lock for a download that will never
+/// complete, which desyncs its clipboard state.
+#[test]
+fn initiate_file_copy_releases_outgoing_download_locks() {
+    let mut cliprdr = ready_locking_client();
+
+    // Two remote file lists => two outgoing download locks (e.g. two in-flight downloads).
+    let lock1 = process_file_format_list(&mut cliprdr);
+    let lock2 = process_file_format_list(&mut cliprdr);
+    assert_eq!(cliprdr.__test_outgoing_locks().len(), 2);
+
+    let messages: Vec<SvcMessage> = cliprdr
+        .initiate_file_copy(vec![FileDescriptor::new("upload.txt")])
+        .unwrap()
+        .into();
+
+    // Every outgoing lock is released and the current lock id is cleared.
+    assert!(
+        cliprdr.__test_outgoing_locks().is_empty(),
+        "outgoing locks must be released when taking clipboard ownership"
+    );
+    assert_eq!(cliprdr.__test_current_lock_id(), None);
+
+    // Wire order: an Unlock for each held lock, THEN our FormatList last.
+    assert_eq!(messages.len(), 3, "expected 2 Unlock PDUs + 1 FormatList");
+
+    decode_pdu!(messages[0] => _b0, pdu0);
+    let id0 = match pdu0 {
+        ClipboardPdu::UnlockData(id) => id.0,
+        other => panic!("expected UnlockData first, got {other:?}"),
+    };
+    decode_pdu!(messages[1] => _b1, pdu1);
+    let id1 = match pdu1 {
+        ClipboardPdu::UnlockData(id) => id.0,
+        other => panic!("expected UnlockData second, got {other:?}"),
+    };
+    let mut unlocked = [id0, id1];
+    unlocked.sort_unstable();
+    let mut expected = [lock1, lock2];
+    expected.sort_unstable();
+    assert_eq!(unlocked, expected, "both download locks must be unlocked");
+
+    decode_pdu!(messages[2] => _b2, last_pdu);
+    assert!(
+        matches!(last_pdu, ClipboardPdu::FormatList(_)),
+        "FormatList must come after the Unlock PDUs, got {last_pdu:?}"
+    );
+}
+
+/// With no outgoing locks held, `initiate_file_copy` sends only the `FormatList`
+/// (no spurious `Unlock`).
+#[test]
+fn initiate_file_copy_without_locks_sends_only_format_list() {
+    let mut cliprdr = ready_locking_client();
+    assert!(cliprdr.__test_outgoing_locks().is_empty());
+
+    let messages: Vec<SvcMessage> = cliprdr
+        .initiate_file_copy(vec![FileDescriptor::new("upload.txt")])
+        .unwrap()
+        .into();
+
+    assert_eq!(messages.len(), 1, "expected only a FormatList when no locks are held");
+    decode_pdu!(messages[0] => _b0, pdu);
+    assert!(
+        matches!(pdu, ClipboardPdu::FormatList(_)),
+        "expected FormatList, got {pdu:?}"
+    );
+}
+
+// ── Receiver-side locked file list snapshots ────────────────────────
+
+/// [MS-RDPECLIP] 3.1.5.4.6 - a request carrying a `clipDataId` is validated
+/// against the list that lock covers.
+///
+/// A Lock PDU asks the remote to keep its File Stream data alive across a
+/// clipboard change, and 3.1.5.4.6 requires that data to service a request
+/// carrying the id, while 3.1.5.4.5 has the index come from a File List.
+/// Validating such a request against the *current* remote file list defeats
+/// that: replacing a two-file selection with a one-file one made an
+/// already-issued request for index 1 fail, even though the locked data still
+/// had the file.
+#[test]
+fn a_locked_request_validates_against_the_list_its_lock_covers() {
+    let mut cliprdr = init_ready_locking_client();
+
+    // Selection A: two files, locked.
+    set_remote_file_list(
+        &mut cliprdr,
+        vec![FileDescriptor::new("a.txt"), FileDescriptor::new("b.txt")],
+    );
+    let lock_for_a = cliprdr
+        .__test_current_lock_id()
+        .expect("a file Format List must create a lock when CAN_LOCK_CLIPDATA is negotiated");
+
+    // Selection B replaces it: one file, under a new lock. A's lock expires but
+    // is deliberately kept, because transfers from A may still be in flight.
+    set_remote_file_list(&mut cliprdr, vec![FileDescriptor::new("c.txt")]);
+    assert_ne!(
+        cliprdr.__test_current_lock_id(),
+        Some(lock_for_a),
+        "selection B must be covered by its own lock"
+    );
+
+    // A's second file, requested under A's lock.
+    let under_a = FileContentsRequest {
+        stream_id: 1,
+        index: 1,
+        flags: FileContentsFlags::SIZE,
+        position: 0,
+        requested_size: 8,
+        data_id: Some(lock_for_a),
+    };
+    assert!(
+        cliprdr.request_file_contents(under_a).is_ok(),
+        "index 1 is in bounds for the two-file list this clipDataId locked; \
+         rejecting it strands a transfer the remote is still holding data for"
+    );
+
+    // Selection B is still bounded by its own list.
+    let past_b = FileContentsRequest {
+        stream_id: 2,
+        index: 1,
+        flags: FileContentsFlags::SIZE,
+        position: 0,
+        requested_size: 8,
+        data_id: None,
+    };
+    assert!(
+        cliprdr.request_file_contents(past_b).is_err(),
+        "index 1 does not exist in the current one-file selection"
+    );
+}
+
+/// A snapshot lives and dies with its lock.
+#[test]
+fn a_snapshot_is_released_with_the_lock_it_belongs_to() {
+    let mut cliprdr = init_ready_locking_client();
+
+    set_remote_file_list(
+        &mut cliprdr,
+        vec![FileDescriptor::new("a.txt"), FileDescriptor::new("b.txt")],
+    );
+    let lock_for_a = cliprdr.__test_current_lock_id().unwrap();
+
+    // Replace the selection, then let the sweep release the expired lock.
+    set_remote_file_list(&mut cliprdr, vec![FileDescriptor::new("c.txt")]);
+    cliprdr
+        .downcast_backend::<LockingBackend>()
+        .unwrap()
+        .advance_ms(10 * 60 * 1000);
+    let _ = cliprdr.drive_timeouts().unwrap();
+
+    assert!(
+        !cliprdr.__test_outgoing_locks().contains_key(&lock_for_a),
+        "the sweep must have released the expired lock"
+    );
+
+    let under_a = FileContentsRequest {
+        stream_id: 3,
+        index: 1,
+        flags: FileContentsFlags::SIZE,
+        position: 0,
+        requested_size: 8,
+        data_id: Some(lock_for_a),
+    };
+    assert!(
+        cliprdr.request_file_contents(under_a).is_err(),
+        "once the Unlock went out the remote released the data, so the snapshot \
+         must not keep validating requests against it"
+    );
 }

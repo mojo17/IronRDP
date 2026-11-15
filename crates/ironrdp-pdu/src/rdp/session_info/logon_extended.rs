@@ -1,3 +1,5 @@
+use core::fmt;
+
 use bitflags::bitflags;
 use ironrdp_core::{
     Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, cast_length, ensure_fixed_part_size,
@@ -43,7 +45,7 @@ impl Encode for LogonInfoExtended {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size());
 
-        dst.write_u16(cast_length!("internalSize", self.get_internal_size())?);
+        dst.write_u16(cast_length!("internalSize", self.get_internal_size(), in: dst)?);
         dst.write_u32(self.present_fields_flags.bits());
 
         if let Some(ref reconnect) = self.auto_reconnect {
@@ -97,11 +99,27 @@ impl<'de> Decode<'de> for LogonInfoExtended {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct ServerAutoReconnect {
     pub logon_id: u32,
     pub random_bits: [u8; AUTO_RECONNECT_RANDOM_BITS_SIZE],
+}
+
+impl fmt::Debug for ServerAutoReconnect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // NOTE: do not show secret (auto-reconnect random).
+        //
+        // These bytes key the HMAC that proves, on reconnect, that this client
+        // was the one last attached to the session ([MS-RDPBCGR] 5.5), so they
+        // are credential material: the spec has the client store the cookie
+        // "in memory, never allowing programmatic access to it". Printing them
+        // would put a live reconnect credential wherever the containing PDU or
+        // event is logged.
+        f.debug_struct("ServerAutoReconnect")
+            .field("logon_id", &self.logon_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ServerAutoReconnect {
@@ -140,12 +158,12 @@ impl<'de> Decode<'de> for ServerAutoReconnect {
         let packet_length = src.read_u32();
         if packet_length != u32::try_from(AUTO_RECONNECT_PACKET_SIZE).expect("AUTO_RECONNECT_PACKET_SIZE fits into u32")
         {
-            return Err(invalid_field_err!("packetLen", "invalid auto-reconnect packet size"));
+            return Err(invalid_field_err!("packetLen", "invalid auto-reconnect packet size", in: src));
         }
 
         let version = src.read_u32();
         if version != AUTO_RECONNECT_VERSION_1 {
-            return Err(invalid_field_err!("version", "invalid auto-reconnect version"));
+            return Err(invalid_field_err!("version", "invalid auto-reconnect version", in: src));
         }
 
         let logon_id = src.read_u32();
@@ -196,13 +214,19 @@ impl<'de> Decode<'de> for LogonErrorsInfo {
         ensure_fixed_part_size!(in: src);
 
         let _data_length = src.read_u32();
-        let error_type = LogonErrorNotificationType::from_u32(src.read_u32())
-            .ok_or_else(|| invalid_field_err!("errorType", "invalid logon error type"))?;
+        // Any value other than a LOGON_MSG_* code or ERROR_CODE_ACCESS_DENIED is an NTSTATUS
+        // ([MS-RDPBCGR] 2.2.10.1.1.4.1.1).
+        let error_type = LogonErrorNotificationType::from_u32(src.read_u32());
 
         let error_notification_data = src.read_u32();
-        let error_data = LogonErrorNotificationDataErrorCode::from_u32(error_notification_data)
-            .map(LogonErrorNotificationData::ErrorCode)
-            .unwrap_or(LogonErrorNotificationData::SessionId(error_notification_data));
+        // The LOGON_MSG_* types always carry a session identifier, even one in the LOGON_FAILED_* range.
+        let error_data = if error_type.carries_session_id() {
+            LogonErrorNotificationData::SessionId(error_notification_data)
+        } else {
+            LogonErrorNotificationDataErrorCode::from_u32(error_notification_data)
+                .map(LogonErrorNotificationData::ErrorCode)
+                .unwrap_or(LogonErrorNotificationData::SessionId(error_notification_data))
+        };
 
         Ok(Self { error_type, error_data })
     }
@@ -219,27 +243,68 @@ bitflags! {
     }
 }
 
-#[repr(u32)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, FromPrimitive)]
+/// The `ErrorNotificationType` of a [`LogonErrorsInfo`] ([MS-RDPBCGR] 2.2.10.1.1.4.1.1).
+///
+/// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum LogonErrorNotificationType {
-    SessionBusyOptions = 0xFFFF_FFF8,
-    DisconnectRefused = 0xFFFF_FFF9,
-    NoPermission = 0xFFFF_FFFA,
-    BumpOptions = 0xFFFF_FFFB,
-    ReconnectOptions = 0xFFFF_FFFC,
-    SessionTerminate = 0xFFFF_FFFD,
-    SessionContinue = 0xFFFF_FFFE,
-    AccessDenied = 0xFFFF_FFFF,
+    /// `LOGON_MSG_SESSION_BUSY_OPTIONS` (0xFFFFFFF8).
+    SessionBusyOptions,
+    /// `LOGON_MSG_DISCONNECT_REFUSED` (0xFFFFFFF9).
+    DisconnectRefused,
+    /// `LOGON_MSG_NO_PERMISSION` (0xFFFFFFFA).
+    NoPermission,
+    /// `LOGON_MSG_BUMP_OPTIONS` (0xFFFFFFFB).
+    BumpOptions,
+    /// `LOGON_MSG_RECONNECT_OPTIONS` (0xFFFFFFFC).
+    ReconnectOptions,
+    /// `LOGON_MSG_SESSION_TERMINATE` (0xFFFFFFFD).
+    SessionTerminate,
+    /// `LOGON_MSG_SESSION_CONTINUE` (0xFFFFFFFE).
+    SessionContinue,
+    /// `ERROR_CODE_ACCESS_DENIED` (0xFFFFFFFF).
+    AccessDenied,
+    /// An NTSTATUS value describing the logon failure, such as `STATUS_LOGON_FAILURE` (0xC000006D).
+    NtStatus(u32),
 }
 
 impl LogonErrorNotificationType {
-    #[expect(
-        clippy::as_conversions,
-        reason = "guarantees discriminant layout, and as is the only way to cast enum -> primitive"
-    )]
-    fn as_u32(self) -> u32 {
-        self as u32
+    /// Converts an `ErrorNotificationType` value. Every value is valid: any value that is not a named
+    /// type is an NTSTATUS.
+    pub fn from_u32(value: u32) -> Self {
+        match value {
+            0xFFFF_FFF8 => Self::SessionBusyOptions,
+            0xFFFF_FFF9 => Self::DisconnectRefused,
+            0xFFFF_FFFA => Self::NoPermission,
+            0xFFFF_FFFB => Self::BumpOptions,
+            0xFFFF_FFFC => Self::ReconnectOptions,
+            0xFFFF_FFFD => Self::SessionTerminate,
+            0xFFFF_FFFE => Self::SessionContinue,
+            0xFFFF_FFFF => Self::AccessDenied,
+            status => Self::NtStatus(status),
+        }
+    }
+
+    /// Returns the `ErrorNotificationType` value.
+    pub fn as_u32(self) -> u32 {
+        match self {
+            Self::SessionBusyOptions => 0xFFFF_FFF8,
+            Self::DisconnectRefused => 0xFFFF_FFF9,
+            Self::NoPermission => 0xFFFF_FFFA,
+            Self::BumpOptions => 0xFFFF_FFFB,
+            Self::ReconnectOptions => 0xFFFF_FFFC,
+            Self::SessionTerminate => 0xFFFF_FFFD,
+            Self::SessionContinue => 0xFFFF_FFFE,
+            Self::AccessDenied => 0xFFFF_FFFF,
+            Self::NtStatus(status) => status,
+        }
+    }
+
+    /// Whether `ErrorNotificationData` holds the session identifier, which is the case for every
+    /// `LOGON_MSG_*` type.
+    pub fn carries_session_id(self) -> bool {
+        !matches!(self, Self::AccessDenied | Self::NtStatus(_))
     }
 }
 

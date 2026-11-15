@@ -80,10 +80,7 @@ impl ChannelName {
     ///
     /// Panics if input is not null-terminated.
     pub const fn from_static(value: &'static [u8; 8]) -> Self {
-        // ensure the last byte is always the null terminator
-        if value[Self::SIZE - 1] != 0 {
-            panic!("channel name must be null-terminated")
-        }
+        assert!(value[Self::SIZE - 1] == 0, "channel name must be null-terminated");
 
         Self {
             inner: Cow::Borrowed(value),
@@ -128,7 +125,7 @@ impl Encode for ClientNetworkData {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_fixed_part_size!(in: dst);
 
-        dst.write_u32(cast_length!("channelCount", self.channels.len())?);
+        dst.write_u32(cast_length!("channelCount", self.channels.len(), in: dst)?);
 
         for channel in self.channels.iter().take(CHANNELS_MAX) {
             channel.encode(dst)?;
@@ -150,10 +147,10 @@ impl<'de> Decode<'de> for ClientNetworkData {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
         ensure_fixed_part_size!(in: src);
 
-        let channel_count = cast_length!("channelCount", src.read_u32())?;
+        let channel_count = cast_length!("channelCount", src.read_u32(), in: src)?;
 
         if channel_count > CHANNELS_MAX {
-            return Err(invalid_field_err!("channelCount", "invalid channel count"));
+            return Err(invalid_field_err!("channelCount", "invalid channel count", in: src));
         }
 
         let mut channels = Vec::with_capacity(channel_count);
@@ -187,7 +184,7 @@ impl Encode for ServerNetworkData {
         ensure_size!(in: dst, size: self.size());
 
         dst.write_u16(self.io_channel);
-        dst.write_u16(cast_length!("channelIdLen", self.channel_ids.len())?);
+        dst.write_u16(cast_length!("channelIdLen", self.channel_ids.len(), in: dst)?);
 
         for channel_id in self.channel_ids.iter() {
             dst.write_u16(*channel_id);
@@ -221,7 +218,7 @@ impl<'de> Decode<'de> for ServerNetworkData {
         ensure_fixed_part_size!(in: src);
 
         let io_channel = src.read_u16();
-        let channel_count = cast_length!("channelCount", src.read_u16())?;
+        let channel_count = cast_length!("channelCount", src.read_u16(), in: src)?;
 
         ensure_size!(in: src, size: channel_count * 2);
         let mut channel_ids = Vec::with_capacity(channel_count);
@@ -282,8 +279,23 @@ impl<'de> Decode<'de> for ChannelDef {
         let name = src.read_array();
         let name = ChannelName::new(name);
 
-        let options = ChannelOptions::from_bits(src.read_u32())
-            .ok_or_else(|| invalid_field_err!("options", "invalid channel options"))?;
+        // Undefined bits are kept rather than rejected. [MS-RDPBCGR]
+        // 2.2.1.3.4.1 never asks a server to validate this field, and for five
+        // of the eleven flags it asks the opposite: CHANNEL_OPTION_INITIALIZED,
+        // ENCRYPT_RDP, ENCRYPT_SC and ENCRYPT_CS are each "unused and its value
+        // MUST be ignored by the server", and SHOW_PROTOCOL likewise.
+        //
+        // Rejecting is not only stricter than the protocol, it costs real
+        // sessions. rdesktop 1.9.0 writes this one field big-endian while the
+        // rest of the block is little-endian (secure.c:516 uses
+        // `out_uint32_be`), so every channel it registers arrives byte-swapped
+        // and every bit lands outside the mask -- and a server that rejects
+        // drops the connection at GCC, before any channel is joined.
+        //
+        // This is the "peer advertisements" case in STYLE.md's "Decoding
+        // unknown values": `from_bits_retain` keeps the unknown bits so that a
+        // decode -> encode round-trip reproduces the wire bytes.
+        let options = ChannelOptions::from_bits_retain(src.read_u32());
 
         Ok(Self { name, options })
     }
@@ -304,5 +316,61 @@ bitflags! {
         const COMPRESS = 0x0040_0000;
         const SHOW_PROTOCOL = 0x0020_0000;
         const REMOTE_CONTROL_PERSISTENT = 0x0010_0000;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn channel_def(name: &[u8; 8], options: u32) -> Vec<u8> {
+        let mut bytes = name.to_vec();
+        bytes.extend_from_slice(&options.to_le_bytes());
+        bytes
+    }
+
+    /// [MS-RDPBCGR] 2.2.1.3.4.1 asks the server to ignore several of these
+    /// flags and never asks it to validate the field, so a bit the server does
+    /// not know is not a reason to refuse the connection. The known bits are
+    /// still readable, and the unknown ones are kept rather than dropped.
+    #[test]
+    fn undefined_option_bits_are_kept_rather_than_refused() {
+        let known = ChannelOptions::INITIALIZED | ChannelOptions::COMPRESS_RDP;
+        let bytes = channel_def(b"rdpdr\0\0\0", known.bits() | 0x0000_0044);
+
+        let decoded = ChannelDef::decode(&mut ReadCursor::new(&bytes)).expect("undefined bits are not fatal");
+
+        assert!(decoded.options.contains(known));
+        assert_eq!(decoded.options.bits(), known.bits() | 0x0000_0044);
+    }
+
+    /// The value rdesktop 1.9.0 actually puts on the wire for its clipboard
+    /// channel: its flags written big-endian in a little-endian field, so every
+    /// set bit is undefined. Refusing it drops the connection at GCC, before a
+    /// single channel is joined; keeping the bits lets the channel through.
+    #[test]
+    fn a_wholly_undefined_value_still_yields_a_channel() {
+        let raw = u32::from_le_bytes([0xc0, 0xa0, 0x00, 0x00]);
+        let bytes = channel_def(b"cliprdr\0", raw);
+
+        let decoded = ChannelDef::decode(&mut ReadCursor::new(&bytes)).expect("still a channel");
+
+        assert_eq!(decoded.name.as_str(), Some("cliprdr"));
+        assert_eq!(decoded.options.bits(), raw);
+    }
+
+    /// Retaining unknown bits keeps decode -> encode byte-for-byte, which is
+    /// the reason STYLE.md prefers `from_bits_retain` over `from_bits_truncate`
+    /// for advertisement fields: replay tooling and the round-trip fuzz oracle
+    /// depend on it.
+    #[test]
+    fn undefined_option_bits_survive_a_round_trip() {
+        let bytes = channel_def(b"rdpdr\0\0\0", 0xdead_beef);
+
+        let decoded = ChannelDef::decode(&mut ReadCursor::new(&bytes)).expect("undefined bits are not fatal");
+
+        let mut out = vec![0u8; bytes.len()];
+        decoded.encode(&mut WriteCursor::new(&mut out)).expect("re-encode");
+        assert_eq!(out, bytes);
     }
 }

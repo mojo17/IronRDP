@@ -11,6 +11,7 @@ use ironrdp_core::{
 };
 
 use crate::pdu::caps::{RimExchangeCapabilityRequest, RimExchangeCapabilityResponse};
+use crate::pdu::completion::ts_urb_result::{Raw, TsUrbResultPayload};
 use crate::pdu::completion::{IoControlCompletion, UrbCompletion, UrbCompletionNoData};
 use crate::pdu::header::{FunctionId, InterfaceId, Mask, SharedMsgHeader, unpack};
 use crate::pdu::iface_manipulation::{InterfaceRelease, QueryInterfaceRequest};
@@ -49,7 +50,7 @@ impl UrbdrcServerControlPdu {
             _ => Err(invalid_field_err!(
                 "SHARED_MSG_HEADER",
                 "invalid RIM_EXCHANGE_CAPABILITY_REQUEST header"
-            )),
+            , in: src)),
         }
     }
 
@@ -61,12 +62,13 @@ impl UrbdrcServerControlPdu {
             _ => Err(invalid_field_err!(
                 "SHARED_MSG_HEADER",
                 "invalid CHANNEL_CREATED header"
-            )),
+            , in: src)),
         }
     }
 }
 
 pub enum UrbdrcServerDevicePdu {
+    Caps(RimExchangeCapabilityRequest),
     ChanCreated(ChannelCreated),
     IfaceRelease(InterfaceRelease),
     QueryIfaceReq(QueryInterfaceRequest),
@@ -81,6 +83,19 @@ pub enum UrbdrcServerDevicePdu {
 }
 
 impl UrbdrcServerDevicePdu {
+    fn decode_caps(src: &mut ReadCursor<'_>, f_id: FunctionId, header: SharedMsgHeader) -> DecodeResult<Self> {
+        match f_id {
+            FunctionId::RIM_EXCHANGE_CAPABILITY_REQUEST => {
+                RimExchangeCapabilityRequest::decode(src, header).map(Self::Caps)
+            }
+            FunctionId::RIMCALL_RELEASE => Ok(Self::IfaceRelease(InterfaceRelease::from_header(header))),
+            FunctionId::RIMCALL_QUERYINTERFACE => QueryInterfaceRequest::decode(src, header).map(Self::QueryIfaceReq),
+            _ => Err(invalid_field_err!(
+                "SHARED_MSG_HEADER",
+                "invalid RIM_EXCHANGE_CAPABILITY_REQUEST header"
+            )),
+        }
+    }
     fn decode_notification(src: &mut ReadCursor<'_>, f_id: FunctionId, header: SharedMsgHeader) -> DecodeResult<Self> {
         match f_id {
             FunctionId::CHANNEL_CREATED => ChannelCreated::decode(src, header).map(Self::ChanCreated),
@@ -89,7 +104,7 @@ impl UrbdrcServerDevicePdu {
             _ => Err(invalid_field_err!(
                 "SHARED_MSG_HEADER",
                 "invalid CHANNEL_CREATED header"
-            )),
+            , in: src)),
         }
     }
 }
@@ -102,7 +117,7 @@ impl Decode<'_> for UrbdrcServerControlPdu {
         match unpack(header.iface_id)? {
             (InterfaceId::CAPABILITIES, Mask::None) => Self::decode_caps(src, f_id, header),
             (InterfaceId::NOTIFY_CLIENT, Mask::Proxy) => Self::decode_notification(src, f_id, header),
-            _ => Err(invalid_field_err!("SHARED_MSG_HEADER", "invalid header")),
+            _ => Err(invalid_field_err!("SHARED_MSG_HEADER", "invalid header", in: src)),
         }
     }
 }
@@ -113,6 +128,7 @@ impl Decode<'_> for UrbdrcServerDevicePdu {
         let f_id = header.function_id.expect("missing function id");
 
         match unpack(header.iface_id)? {
+            (InterfaceId::CAPABILITIES, Mask::None) => Self::decode_caps(src, f_id, header),
             (InterfaceId::NOTIFY_CLIENT, Mask::Proxy) => Self::decode_notification(src, f_id, header),
             (udev_iface, Mask::Proxy) => match f_id {
                 FunctionId::RIMCALL_RELEASE => Ok(Self::IfaceRelease(InterfaceRelease::from_header(header))),
@@ -142,9 +158,9 @@ impl Decode<'_> for UrbdrcServerDevicePdu {
                 _ => Err(invalid_field_err!(
                     "SHARED_MSG_HEADER::FunctionId",
                     "unsupported function id for USB device interface"
-                )),
+                , in: src)),
             },
-            _ => Err(invalid_field_err!("SHARED_MSG_HEADER", "invalid header")),
+            _ => Err(invalid_field_err!("SHARED_MSG_HEADER", "invalid header", in: src)),
         }
     }
 }
@@ -165,6 +181,7 @@ macro_rules! fill_server_dev_pdu_arms {
     ($pdu:expr, $($tokens:tt)*) => {{
         use UrbdrcServerDevicePdu::*;
         match <&UrbdrcServerDevicePdu>::from($pdu) {
+            Caps(rim_exchange_capability_request) => rim_exchange_capability_request$($tokens)*,
             ChanCreated(channel_created) => channel_created$($tokens)*,
             IfaceRelease(iface_release) => iface_release$($tokens)*,
             QueryIfaceReq(query_iface_req) => query_iface_req$($tokens)*,
@@ -217,13 +234,14 @@ pub enum UrbdrcClientControlPdu {
     QueryIfaceReq(QueryInterfaceRequest),
 }
 
-pub enum UrbdrcClientDevicePdu {
+pub enum UrbdrcClientDevicePdu<P> {
+    Caps(RimExchangeCapabilityResponse),
     ChanCreated(ChannelCreated),
     AddDev(AddDevice),
     DevTextRsp(QueryDeviceTextRsp),
     IoctlComp(IoControlCompletion),
     UrbComp(UrbCompletion),
-    UrbCompNoData(UrbCompletionNoData),
+    UrbCompNoData(UrbCompletionNoData<P>),
     IfaceRelease(InterfaceRelease),
     QueryIfaceReq(QueryInterfaceRequest),
 }
@@ -239,7 +257,7 @@ impl UrbdrcClientControlPdu {
             _ => Err(invalid_field_err!(
                 "SHARED_MSG_HEADER",
                 "invalid function id in DEVICE_SINK"
-            )),
+            , in: src)),
         }
     }
     fn decode_notification(src: &mut ReadCursor<'_>, header: SharedMsgHeader) -> DecodeResult<Self> {
@@ -252,7 +270,7 @@ impl UrbdrcClientControlPdu {
             _ => Err(invalid_field_err!(
                 "SHARED_MSG_HEADER",
                 "invalid function id in CHANNEL_CREATED"
-            )),
+            , in: src)),
         }
     }
 }
@@ -267,12 +285,12 @@ impl Decode<'_> for UrbdrcClientControlPdu {
             }
             (InterfaceId::DEVICE_SINK, Mask::Proxy) => Self::decode_sink(src, header),
             (InterfaceId::NOTIFY_SERVER, Mask::Proxy) => Self::decode_notification(src, header),
-            _ => Err(invalid_field_err!("SHARED_MSG_HEADER", "invalid header")),
+            _ => Err(invalid_field_err!("SHARED_MSG_HEADER", "invalid header", in: src)),
         }
     }
 }
 
-impl UrbdrcClientDevicePdu {
+impl<P> UrbdrcClientDevicePdu<P> {
     fn decode_sink(src: &mut ReadCursor<'_>, header: SharedMsgHeader) -> DecodeResult<Self> {
         ensure_size!(in: src, size: 4 /* function id */);
         let f_id = FunctionId(src.read_u32());
@@ -283,7 +301,7 @@ impl UrbdrcClientDevicePdu {
             _ => Err(invalid_field_err!(
                 "SHARED_MSG_HEADER",
                 "invalid function id in DEVICE_SINK"
-            )),
+            , in: src)),
         }
     }
     fn decode_notification(src: &mut ReadCursor<'_>, header: SharedMsgHeader) -> DecodeResult<Self> {
@@ -296,16 +314,19 @@ impl UrbdrcClientDevicePdu {
             _ => Err(invalid_field_err!(
                 "SHARED_MSG_HEADER",
                 "invalid function id in CHANNEL_CREATED"
-            )),
+            , in: src)),
         }
     }
 }
 
-impl Decode<'_> for UrbdrcClientDevicePdu {
+impl Decode<'_> for UrbdrcClientDevicePdu<Raw> {
     fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
         let header = SharedMsgHeader::decode(src)?;
 
         match unpack(header.iface_id)? {
+            (InterfaceId::CAPABILITIES, Mask::None) => {
+                RimExchangeCapabilityResponse::decode(src, header).map(Self::Caps)
+            }
             (InterfaceId::DEVICE_SINK, Mask::Proxy) => Self::decode_sink(src, header),
             (InterfaceId::NOTIFY_SERVER, Mask::Proxy) => Self::decode_notification(src, header),
             (udev_iface, Mask::Stub) => {
@@ -330,10 +351,10 @@ impl Decode<'_> for UrbdrcClientDevicePdu {
                     _ => Err(invalid_field_err!(
                         "SHARED_MSG_HEADER::InterfaceId",
                         "unknown interface id"
-                    )),
+                    , in: src)),
                 }
             }
-            _ => Err(invalid_field_err!("SHARED_MSG_HEADER", "invalid header")),
+            _ => Err(invalid_field_err!("SHARED_MSG_HEADER", "invalid header", in: src)),
         }
     }
 }
@@ -354,7 +375,8 @@ macro_rules! fill_client_ctl_pdu_arms {
 macro_rules! fill_client_dev_pdu_arms {
     ($pdu:expr, $($tokens:tt)*) => {{
         use UrbdrcClientDevicePdu::*;
-        match <&UrbdrcClientDevicePdu>::from($pdu) {
+        match <&UrbdrcClientDevicePdu<TsUrbResultPayload>>::from($pdu) {
+            Caps(rim_exchange_capability_response) => rim_exchange_capability_response$($tokens)*,
             ChanCreated(channel_created) => channel_created$($tokens)*,
             IfaceRelease(iface_release) => iface_release$($tokens)*,
             QueryIfaceReq(query_iface_req) => query_iface_req$($tokens)*,
@@ -381,7 +403,7 @@ impl Encode for UrbdrcClientControlPdu {
     }
 }
 
-impl Encode for UrbdrcClientDevicePdu {
+impl Encode for UrbdrcClientDevicePdu<TsUrbResultPayload> {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         fill_client_dev_pdu_arms!(self, .encode(dst))
     }

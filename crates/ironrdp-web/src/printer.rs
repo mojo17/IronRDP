@@ -230,9 +230,13 @@ impl RdpdrBackend for WasmPrinterBackend {
         Ok(())
     }
 
-    fn handle_scard_call(&mut self, _req: DeviceControlRequest<ScardIoCtlCode>, _call: ScardCall) -> PduResult<()> {
+    fn handle_scard_call(
+        &mut self,
+        _req: DeviceControlRequest<ScardIoCtlCode>,
+        _call: ScardCall,
+    ) -> PduResult<Vec<SvcMessage>> {
         warn!("Smartcard IOCTL reached printer-only backend; ignoring");
-        Ok(())
+        Ok(Vec::new())
     }
 
     fn handle_drive_io_request(&mut self, _req: ServerDriveIoRequest) -> PduResult<Vec<SvcMessage>> {
@@ -355,6 +359,18 @@ impl RdpdrBackend for WasmPrinterBackend {
                 Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCloseResponse(response))])
             }
         }
+    }
+
+    fn reject_printer_write(&mut self, req: ironrdp::rdpdr::pdu::efs::DeviceIoRequest) -> PduResult<Vec<SvcMessage>> {
+        if self.open_files.remove(&req.file_id).is_some() {
+            self.proxy.send_job_aborted(req.file_id);
+        }
+        Ok(vec![SvcMessage::from(RdpdrPdu::DeviceWriteResponse(
+            DeviceWriteResponse {
+                device_io_reply: DeviceIoResponse::new(req, NtStatus::INVALID_PARAMETER),
+                length: 0,
+            },
+        ))])
     }
 }
 

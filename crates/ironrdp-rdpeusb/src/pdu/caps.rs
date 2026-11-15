@@ -7,6 +7,7 @@
 use ironrdp_core::{
     DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, ensure_fixed_part_size, ensure_size, invalid_field_err,
 };
+use ironrdp_dvc::DvcEncode;
 
 use crate::pdu::header::{FunctionId, InterfaceId, Mask, MessageId, SharedMsgHeader};
 use crate::pdu::utils::HResult;
@@ -55,7 +56,8 @@ impl RimExchangeCapabilityRequest {
         if src.read_u32() != 1 {
             return Err(invalid_field_err!(
                 "RIM_EXCHANGE_CAPABILITY_REQUEST::CapabilityValue",
-                "is not 0x1 (RIM_CAPABILITY_VERSION_01)"
+                "is not 0x1 (RIM_CAPABILITY_VERSION_01)",
+                in: src,
             ));
         }
         Ok(Self {
@@ -117,7 +119,8 @@ impl RimExchangeCapabilityResponse {
         if src.read_u32() != 1 {
             return Err(invalid_field_err!(
                 "RIM_EXCHANGE_CAPABILITY_RESPONSE::CapabilityValue",
-                "is not 0x1 (RIM_CAPABILITY_VERSION_01)"
+                "is not 0x1 (RIM_CAPABILITY_VERSION_01)",
+                in: src,
             ));
         };
         let result = src.read_u32();
@@ -151,3 +154,6 @@ impl Encode for RimExchangeCapabilityResponse {
         Self::FIXED_PART_SIZE
     }
 }
+
+impl DvcEncode for RimExchangeCapabilityRequest {}
+impl DvcEncode for RimExchangeCapabilityResponse {}

@@ -1,10 +1,10 @@
 [package]
 name = "ironrdp-dvc-com-plugin"
-version = "0.1.1"
+version = "0.3.0"
 readme = "README.md"
 description = "DVC COM client plugin loader for IronRDP (Windows)"
 edition.workspace = true
-rust-version = "1.89"
+rust-version = "1.94"
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -19,17 +19,18 @@ test = false
 [dependencies]
 
 [target.'cfg(windows)'.dependencies]
-ironrdp-core = { path = "../ironrdp-core", version = "0.2" }
-ironrdp-pdu = { path = "../ironrdp-pdu", version = "0.8" }
-ironrdp-dvc = { path = "../ironrdp-dvc", version = "0.6" }
-ironrdp-svc = { path = "../ironrdp-svc", version = "0.7" }
+ironrdp-core = { path = "../ironrdp-core", version = "0.3" }
+ironrdp-pdu = { path = "../ironrdp-pdu", version = "0.11" } # public (PduResult type)
+ironrdp-dvc = { path = "../ironrdp-dvc", version = "0.10" } # public
+ironrdp-svc = { path = "../ironrdp-svc", version = "0.10" } # public (SvcMessage type)
 tracing = { version = "0.1", features = ["log"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
-    "Win32_System_RemoteDesktop",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_LibraryLoader",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_SystemInformation",
 ] }
 windows-core = "0.62"
 

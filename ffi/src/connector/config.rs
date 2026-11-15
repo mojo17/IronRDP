@@ -2,6 +2,41 @@ use ironrdp::pdu::rdp::client_info::PerformanceFlags;
 
 use self::ffi::PerformanceFlagsType;
 
+/// The bitmap settings used when the caller sets none, matching the native client.
+///
+/// Without a codec on offer, the server falls back to sending the screen as nearly raw bitmaps,
+/// which is so much data that it starts dropping frames. Offering RemoteFX fixes that.
+fn default_bitmap_config() -> Result<ironrdp::connector::BitmapConfig, Box<crate::error::ffi::IronRdpError>> {
+    let codecs = ironrdp::pdu::rdp::capability_sets::client_codecs_capabilities(&[])
+        .map_err(|help| -> Box<crate::error::ffi::IronRdpError> { help.as_str().into() })?;
+
+    Ok(ironrdp::connector::BitmapConfig {
+        color_depth: 32,
+        lossy_compression: true,
+        codecs,
+    })
+}
+
+// `ironrdp::pdu::gcc::KeyboardType` is a permissive newtype (MS-RDPBCGR's value table for this
+// field has grown across revisions), not a fieldless enum, so `diplomat::enum_convert` no longer
+// applies to it; this conversion is written by hand instead. It must live outside the
+// `#[diplomat::bridge]` module below, since that macro only understands inherent impls on the
+// bridged types, not trait impls. The FFI-facing enum keeps its existing fixed set of variants
+// unchanged.
+impl From<ffi::KeyboardType> for ironrdp::pdu::gcc::KeyboardType {
+    fn from(value: ffi::KeyboardType) -> Self {
+        match value {
+            ffi::KeyboardType::IbmPcXt => Self::IBM_PC_XT,
+            ffi::KeyboardType::OlivettiIco => Self::OLIVETTI_ICO,
+            ffi::KeyboardType::IbmPcAt => Self::IBM_PC_AT,
+            ffi::KeyboardType::IbmEnhanced => Self::IBM_ENHANCED,
+            ffi::KeyboardType::Nokia1050 => Self::NOKIA_1050,
+            ffi::KeyboardType::Nokia9140 => Self::NOKIA_9140,
+            ffi::KeyboardType::Japanese => Self::JAPANESE,
+        }
+    }
+}
+
 #[diplomat::bridge]
 pub mod ffi {
     use ironrdp::connector::Credentials;
@@ -21,13 +56,14 @@ pub mod ffi {
             Box::<ConfigBuilder>::default()
         }
 
+        #[diplomat::attr(auto, getter = "dvc_pipe_proxy")]
         pub fn get_dvc_pipe_proxy(&self) -> Option<Box<DvcPipeProxyConfig>> {
             self.dvc_pipe_proxy.as_ref().map(|dvc| Box::new(dvc.clone()))
         }
     }
 
     #[derive(Default)]
-    #[diplomat::opaque]
+    #[diplomat::opaque_mut]
     pub struct ConfigBuilder {
         pub credentials: Option<Credentials>,
         pub domain: Option<String>,
@@ -54,7 +90,6 @@ pub mod ffi {
         pub dvc_pipe_proxy: Option<DvcPipeProxyConfig>,
     }
 
-    #[diplomat::enum_convert(ironrdp::pdu::gcc::KeyboardType)]
     pub enum KeyboardType {
         IbmPcXt,
         OlivettiIco,
@@ -69,10 +104,12 @@ pub mod ffi {
     pub struct DesktopSize(pub ironrdp::connector::DesktopSize);
 
     impl DesktopSize {
+        #[diplomat::attr(auto, getter = "width")]
         pub fn get_width(&self) -> u16 {
             self.0.width
         }
 
+        #[diplomat::attr(auto, getter = "height")]
         pub fn get_height(&self) -> u16 {
             self.0.height
         }
@@ -90,38 +127,47 @@ pub mod ffi {
             });
         }
 
+        #[diplomat::attr(auto, setter = "domain")]
         pub fn set_domain(&mut self, domain: &str) {
             self.domain = Some(domain.to_owned());
         }
 
+        #[diplomat::attr(auto, setter = "enable_tls")]
         pub fn set_enable_tls(&mut self, enable_tls: bool) {
             self.enable_tls = Some(enable_tls);
         }
 
+        #[diplomat::attr(auto, setter = "enable_credssp")]
         pub fn set_enable_credssp(&mut self, enable_credssp: bool) {
             self.enable_credssp = Some(enable_credssp);
         }
 
+        #[diplomat::attr(auto, setter = "keyboard_layout")]
         pub fn set_keyboard_layout(&mut self, keyboard_layout: u32) {
             self.keyboard_layout = Some(keyboard_layout);
         }
 
+        #[diplomat::attr(auto, setter = "keyboard_type")]
         pub fn set_keyboard_type(&mut self, keyboard_type: KeyboardType) {
             self.keyboard_type = Some(keyboard_type.into());
         }
 
+        #[diplomat::attr(auto, setter = "keyboard_subtype")]
         pub fn set_keyboard_subtype(&mut self, keyboard_subtype: u32) {
             self.keyboard_subtype = Some(keyboard_subtype);
         }
 
+        #[diplomat::attr(auto, setter = "keyboard_functional_keys_count")]
         pub fn set_keyboard_functional_keys_count(&mut self, keyboard_functional_keys_count: u32) {
             self.keyboard_functional_keys_count = Some(keyboard_functional_keys_count);
         }
 
+        #[diplomat::attr(auto, setter = "ime_file_name")]
         pub fn set_ime_file_name(&mut self, ime_file_name: &str) {
             self.ime_file_name = Some(ime_file_name.to_owned());
         }
 
+        #[diplomat::attr(auto, setter = "dig_product_id")]
         pub fn set_dig_product_id(&mut self, dig_product_id: &str) {
             self.dig_product_id = Some(dig_product_id.to_owned());
         }
@@ -130,6 +176,7 @@ pub mod ffi {
             self.desktop_size = Some(ironrdp::connector::DesktopSize { width, height });
         }
 
+        #[diplomat::attr(auto, setter = "performance_flags")]
         pub fn set_performance_flags(&mut self, performance_flags: &PerformanceFlags) {
             self.performance_flags = Some(performance_flags.0);
         }
@@ -138,34 +185,42 @@ pub mod ffi {
         //     self.timezone_info = timezone_info;
         // }
 
+        #[diplomat::attr(auto, setter = "bitmap_config")]
         pub fn set_bitmap_config(&mut self, bitmap: &BitmapConfig) {
             self.bitmap = Some(bitmap.0.clone());
         }
 
+        #[diplomat::attr(auto, setter = "client_build")]
         pub fn set_client_build(&mut self, client_build: u32) {
             self.client_build = Some(client_build);
         }
 
+        #[diplomat::attr(auto, setter = "client_name")]
         pub fn set_client_name(&mut self, client_name: &str) {
             self.client_name = Some(client_name.to_owned());
         }
 
+        #[diplomat::attr(auto, setter = "client_dir")]
         pub fn set_client_dir(&mut self, client_dir: &str) {
             self.client_dir = Some(client_dir.to_owned());
         }
 
+        #[diplomat::attr(auto, setter = "enable_server_pointer")]
         pub fn set_enable_server_pointer(&mut self, enable_server_pointer: bool) {
             self.enable_server_pointer = Some(enable_server_pointer);
         }
 
+        #[diplomat::attr(auto, setter = "autologon")]
         pub fn set_autologon(&mut self, autologon: bool) {
             self.autologon = Some(autologon);
         }
 
+        #[diplomat::attr(auto, setter = "pointer_software_rendering")]
         pub fn set_pointer_software_rendering(&mut self, pointer_software_rendering: bool) {
             self.pointer_software_rendering = Some(pointer_software_rendering);
         }
 
+        #[diplomat::attr(auto, setter = "dvc_pipe_proxy")]
         pub fn set_dvc_pipe_proxy(&mut self, dvc_pipe_proxy: &DvcPipeProxyConfig) {
             self.dvc_pipe_proxy = Some(dvc_pipe_proxy.clone());
         }
@@ -176,16 +231,22 @@ pub mod ffi {
                 domain: self.domain.clone(),
                 enable_tls: self.enable_tls.unwrap_or(false),
                 enable_credssp: self.enable_credssp.unwrap_or(true),
+                enable_standard_rdp_security: false,
                 keyboard_layout: self.keyboard_layout.unwrap_or(0),
                 keyboard_type: self
                     .keyboard_type
-                    .unwrap_or(ironrdp::pdu::gcc::KeyboardType::IbmEnhanced),
+                    .unwrap_or(ironrdp::pdu::gcc::KeyboardType::IBM_ENHANCED),
                 keyboard_subtype: self.keyboard_subtype.unwrap_or(0),
                 keyboard_functional_keys_count: self.keyboard_functional_keys_count.unwrap_or(12),
+                connection_type: ironrdp::pdu::gcc::ConnectionType::Lan,
                 ime_file_name: self.ime_file_name.clone().unwrap_or_default(),
                 dig_product_id: self.dig_product_id.clone().unwrap_or_default(),
                 desktop_size: self.desktop_size.ok_or("desktop size not set")?,
-                bitmap: None,
+                monitor_layout: None,
+                bitmap: Some(match &self.bitmap {
+                    Some(bitmap) => bitmap.clone(),
+                    None => super::default_bitmap_config()?,
+                }),
                 client_build: self.client_build.unwrap_or(0),
                 client_name: self.client_name.clone().ok_or("client name not set")?,
                 client_dir: self.client_dir.clone().ok_or("client dir not set")?,
@@ -211,18 +272,27 @@ pub mod ffi {
 
                 enable_server_pointer: self.enable_server_pointer.unwrap_or(false),
                 autologon: self.autologon.unwrap_or(false),
-                enable_audio_playback: self.no_audio_playback.unwrap_or(true),
+                enable_audio_playback: !self.no_audio_playback.unwrap_or(false),
+                enable_audio_capture: false,
                 request_data: None,
                 compression_type: None,
                 pointer_software_rendering: self.pointer_software_rendering.unwrap_or(false),
                 multitransport_flags: None,
+                support_dyn_vc_gfx_protocol: false,
                 performance_flags: self.performance_flags.ok_or("performance flag is missing")?,
                 desktop_scale_factor: 0,
+                desktop_physical_size: None,
+                desktop_orientation: None,
+                device_scale_factor: None,
+                monitor_extended_layout: None,
+                relative_mouse_input: false,
                 hardware_id: None,
                 license_cache: None,
                 timezone_info: self.timezone_info.clone().unwrap_or_default(),
                 alternate_shell: String::new(),
                 work_dir: String::new(),
+                remote_application_mode: false,
+                rail_support_level: ironrdp::pdu::rdp::capability_sets::RailSupportLevel::empty(),
             };
             let dvc_pipe_proxy = self.dvc_pipe_proxy.clone();
 
@@ -235,7 +305,7 @@ pub mod ffi {
         }
     }
 
-    #[diplomat::opaque]
+    #[diplomat::opaque_mut]
     #[derive(Default)]
     pub struct PerformanceFlags(pub ironrdp::pdu::rdp::client_info::PerformanceFlags);
 
@@ -286,5 +356,37 @@ impl From<PerformanceFlagsType> for PerformanceFlags {
             PerformanceFlagsType::Reserved1 => PerformanceFlags::RESERVED1,
             PerformanceFlagsType::Reserved2 => PerformanceFlags::RESERVED2,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ironrdp::pdu::rdp::capability_sets::CodecProperty;
+
+    #[test]
+    fn build_offers_remotefx_when_no_bitmap_config_is_set() {
+        let mut builder = super::ffi::ConfigBuilder::new();
+        builder.with_username_and_password("user", "password");
+        builder.set_desktop_size(768, 1024);
+        builder.set_client_name("client");
+        builder.set_client_dir("C:\\");
+        builder.set_performance_flags(&super::ffi::PerformanceFlags::new_default());
+
+        let Ok(config) = builder.build() else {
+            panic!("a builder with every required field should build");
+        };
+        let Some(bitmap) = config.connector.bitmap else {
+            panic!("the config should carry bitmap settings");
+        };
+
+        assert_eq!(bitmap.color_depth, 32);
+        assert!(bitmap.lossy_compression);
+        assert!(
+            bitmap
+                .codecs
+                .0
+                .iter()
+                .any(|codec| matches!(codec.property, CodecProperty::RemoteFx(_)))
+        );
     }
 }

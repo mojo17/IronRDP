@@ -15,6 +15,8 @@ use ironrdp_core::{
     Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, ensure_size, invalid_field_err,
 };
 
+use crate::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -81,6 +83,20 @@ pub const BW_STOP_RELIABLE_UDP: u16 = 0x0429;
 
 /// Bandwidth Measure Stop for continuous detection over lossy UDP.
 pub const BW_STOP_LOSSY_UDP: u16 = 0x0629;
+
+/// Which optional fields a Network Characteristics Result carries, as
+/// `(baseRTT, bandwidth)`.
+///
+/// [MS-RDPBCGR] 2.2.14.1.5 assigns these by `requestType` alone, so encode,
+/// `size` and decode all consult this rather than inspecting the values.
+fn netchar_fields(request_type: u16) -> (bool, bool) {
+    match request_type {
+        NETCHAR_RESULT_RTT => (true, false),
+        NETCHAR_RESULT_BW_RTT => (false, true),
+        NETCHAR_RESULT_ALL => (true, true),
+        _ => (false, false),
+    }
+}
 
 /// Network Characteristics Result: baseRTT + averageRTT (no bandwidth).
 ///
@@ -221,6 +237,11 @@ impl AutoDetectRequest {
     }
 
     /// Construct a Bandwidth Measure Stop for connect-time detection.
+    ///
+    /// `payload` must be non-empty: [MS-RDPBCGR] 2.2.14.1.4 requires `payloadLength`
+    /// to be greater than zero for this request type, so an empty one has no
+    /// conforming encoding and is refused by [`Encode`] rather than written as a
+    /// zero length.
     pub fn bw_stop_connect_time(sequence_number: u16, payload: Vec<u8>) -> Self {
         Self::BandwidthMeasureStop {
             sequence_number,
@@ -303,7 +324,25 @@ impl Encode for AutoDetectRequest {
                 request_type,
                 payload,
             } => {
-                if let Some(data) = payload {
+                // Whether the payload fields appear on the wire is decided by
+                // `requestType`, not by whether a payload was supplied: MS-RDPBCGR
+                // 2.2.14.1.4 puts `payloadLength` and `payload` on the connect-time stop
+                // and on no other. Branching on the `Option` let this disagree with the
+                // decoder, which reads those fields back for `BW_STOP_CONNECT_TIME` and
+                // never for the UDP variants.
+                if *request_type == BW_STOP_CONNECT_TIME {
+                    // 2.2.14.1.4 does not merely make `payloadLength` present for the
+                    // connect-time stop, it requires a value "greater than zero". An
+                    // absent or empty payload has no conforming encoding, so it is
+                    // refused rather than written as a zero length.
+                    let data = payload.as_deref().unwrap_or(&[]);
+                    if data.is_empty() {
+                        return Err(invalid_field_err!(
+                            "payload",
+                            "connect-time Bandwidth Measure Stop requires a non-empty payload",
+                            in: dst
+                        ));
+                    }
                     dst.write_u8(0x08); // headerLength (with payload)
                     dst.write_u8(TYPE_ID_AUTODETECT_REQUEST);
                     dst.write_u16(*sequence_number);
@@ -334,11 +373,24 @@ impl Encode for AutoDetectRequest {
                 dst.write_u16(*sequence_number);
                 dst.write_u16(*request_type);
 
-                if let Some(rtt) = base_rtt_ms {
-                    dst.write_u32(*rtt);
+                // Same rule as the stop above: which fields appear is decided by
+                // `requestType`, not by which `Option`s happen to be set. MS-RDPBCGR
+                // 2.2.14.1.5 assigns 0x0840 baseRTT + averageRTT, 0x0880 bandwidth +
+                // averageRTT, and 0x08C0 all three, and the decoder reads them back on
+                // exactly that basis. Branching on the `Option`s let the two disagree:
+                // a `NETCHAR_RESULT_RTT` with no `base_rtt_ms` wrote a body the decoder
+                // could not read, and one carrying `bandwidth_kbps` instead wrote the
+                // bandwidth where the decoder expects baseRTT, corrupting it silently.
+                let (want_base_rtt, want_bandwidth) = netchar_fields(*request_type);
+                if want_base_rtt {
+                    dst.write_u32(base_rtt_ms.ok_or_else(
+                        || invalid_field_err!("baseRTT", "requestType requires a baseRTT value", in: dst),
+                    )?);
                 }
-                if let Some(bw) = bandwidth_kbps {
-                    dst.write_u32(*bw);
+                if want_bandwidth {
+                    dst.write_u32(bandwidth_kbps.ok_or_else(
+                        || invalid_field_err!("bandwidth", "requestType requires a bandwidth value", in: dst),
+                    )?);
                 }
                 dst.write_u32(*average_rtt_ms);
             }
@@ -359,20 +411,21 @@ impl Encode for AutoDetectRequest {
                 HEADER_MIN_SIZE + 2 /* payloadLength */ + payload.len()
             }
 
-            Self::BandwidthMeasureStop { payload, .. } => match payload {
-                Some(data) => HEADER_MIN_SIZE + 2 /* payloadLength */ + data.len(),
-                None => HEADER_MIN_SIZE,
-            },
-
-            Self::NetworkCharacteristicsResult {
-                base_rtt_ms,
-                bandwidth_kbps,
-                ..
+            // Mirrors `encode`: the payload fields are keyed off `requestType`.
+            Self::BandwidthMeasureStop {
+                request_type, payload, ..
             } => {
-                HEADER_MIN_SIZE
-                    + if base_rtt_ms.is_some() { 4 } else { 0 }
-                    + if bandwidth_kbps.is_some() { 4 } else { 0 }
-                    + 4 /* averageRTT */
+                if *request_type == BW_STOP_CONNECT_TIME {
+                    HEADER_MIN_SIZE + 2 /* payloadLength */ + payload.as_ref().map_or(0, Vec::len)
+                } else {
+                    HEADER_MIN_SIZE
+                }
+            }
+
+            // Mirrors `encode`: which fields are present is keyed off `requestType`.
+            Self::NetworkCharacteristicsResult { request_type, .. } => {
+                let (want_base_rtt, want_bandwidth) = netchar_fields(*request_type);
+                HEADER_MIN_SIZE + if want_base_rtt { 4 } else { 0 } + if want_bandwidth { 4 } else { 0 } + 4 /* averageRTT */
             }
         }
     }
@@ -388,10 +441,8 @@ impl<'de> Decode<'de> for AutoDetectRequest {
         let header_type_id = src.read_u8();
 
         if header_type_id != TYPE_ID_AUTODETECT_REQUEST {
-            return Err(invalid_field_err!(
-                "headerTypeId",
-                "expected TYPE_ID_AUTODETECT_REQUEST (0x00)"
-            ));
+            return Err(invalid_field_err!( "headerTypeId",
+                "expected TYPE_ID_AUTODETECT_REQUEST (0x00)", in: src));
         }
 
         let sequence_number = src.read_u16();
@@ -423,6 +474,15 @@ impl<'de> Decode<'de> for AutoDetectRequest {
                 // Connect-time stop has payloadLength + payload.
                 ensure_size!(in: src, size: 2);
                 let payload_length = src.read_u16();
+                // A zero length does not conform: 2.2.14.1.4 requires a value greater
+                // than zero, which is why `encode` refuses to emit one. It is still
+                // accepted here, deliberately, because the two directions answer
+                // different questions. Emitting asks what we are permitted to put on the
+                // wire; accepting asks whether we can act on what a peer already sent.
+                // The sequence number and request type are intact, so the Bandwidth
+                // Measure Results reply this PDU asks for is fully determined, and
+                // rejecting it would drop a measurement a server is blocking on rather
+                // than correct anything.
                 ensure_size!(in: src, size: usize::from(payload_length));
                 let payload = src.read_slice(usize::from(payload_length)).to_vec();
                 Ok(Self::BandwidthMeasureStop {
@@ -481,7 +541,7 @@ impl<'de> Decode<'de> for AutoDetectRequest {
                 })
             }
 
-            _ => Err(invalid_field_err!("requestType", "unknown autodetect request type")),
+            _ => Err(invalid_field_err!("requestType", "unknown autodetect request type", in: src)),
         }
     }
 }
@@ -636,10 +696,8 @@ impl<'de> Decode<'de> for AutoDetectResponse {
         let header_type_id = src.read_u8();
 
         if header_type_id != TYPE_ID_AUTODETECT_RESPONSE {
-            return Err(invalid_field_err!(
-                "headerTypeId",
-                "expected TYPE_ID_AUTODETECT_RESPONSE (0x01)"
-            ));
+            return Err(invalid_field_err!( "headerTypeId",
+                "expected TYPE_ID_AUTODETECT_RESPONSE (0x01)", in: src));
         }
 
         let sequence_number = src.read_u16();
@@ -671,14 +729,174 @@ impl<'de> Decode<'de> for AutoDetectResponse {
                 })
             }
 
-            _ => Err(invalid_field_err!("responseType", "unknown autodetect response type")),
+            _ => Err(invalid_field_err!("responseType", "unknown autodetect response type", in: src)),
         }
+    }
+}
+
+// ============================================================================
+// MCS message channel framing
+// ============================================================================
+//
+// Auto-detect is not a Share Data PDU. Per [MS-RDPBCGR] 2.2.14.3 / 2.2.14.4 it
+// rides the MCS message channel framed by a Basic Security Header whose
+// SEC_AUTODETECT_REQ / SEC_AUTODETECT_RSP flag identifies it, the same dispatch
+// mechanism used by multitransport (see `rdp::multitransport`).
+
+/// Server Auto-Detect Request PDU ([MS-RDPBCGR] 2.2.14.3).
+///
+/// Wraps an [`AutoDetectRequest`] with the `SEC_AUTODETECT_REQ` security header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct AutoDetectReqPdu {
+    pub security_header: BasicSecurityHeader,
+    pub request: AutoDetectRequest,
+}
+
+impl AutoDetectReqPdu {
+    const NAME: &'static str = "AutoDetectReqPdu";
+
+    /// Wrap a request with the `SEC_AUTODETECT_REQ` security header.
+    pub fn new(request: AutoDetectRequest) -> Self {
+        Self {
+            security_header: BasicSecurityHeader {
+                flags: BasicSecurityHeaderFlags::AUTODETECT_REQ,
+            },
+            request,
+        }
+    }
+}
+
+impl Encode for AutoDetectReqPdu {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(in: dst, size: self.size());
+
+        self.security_header.encode(dst)?;
+        self.request.encode(dst)?;
+
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn size(&self) -> usize {
+        BasicSecurityHeader::FIXED_PART_SIZE + self.request.size()
+    }
+}
+
+impl<'de> Decode<'de> for AutoDetectReqPdu {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        let security_header = BasicSecurityHeader::decode(src)?;
+
+        if !security_header.flags.contains(BasicSecurityHeaderFlags::AUTODETECT_REQ) {
+            return Err(invalid_field_err!("securityHeader", "expected SEC_AUTODETECT_REQ flag", in: src));
+        }
+
+        let request = AutoDetectRequest::decode(src)?;
+
+        Ok(Self {
+            security_header,
+            request,
+        })
+    }
+}
+
+/// Client Auto-Detect Response PDU ([MS-RDPBCGR] 2.2.14.4).
+///
+/// Wraps an [`AutoDetectResponse`] with the `SEC_AUTODETECT_RSP` security header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct AutoDetectRspPdu {
+    pub security_header: BasicSecurityHeader,
+    pub response: AutoDetectResponse,
+}
+
+impl AutoDetectRspPdu {
+    const NAME: &'static str = "AutoDetectRspPdu";
+
+    /// Wrap a response with the `SEC_AUTODETECT_RSP` security header.
+    pub fn new(response: AutoDetectResponse) -> Self {
+        Self {
+            security_header: BasicSecurityHeader {
+                flags: BasicSecurityHeaderFlags::AUTODETECT_RSP,
+            },
+            response,
+        }
+    }
+}
+
+impl Encode for AutoDetectRspPdu {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(in: dst, size: self.size());
+
+        self.security_header.encode(dst)?;
+        self.response.encode(dst)?;
+
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn size(&self) -> usize {
+        BasicSecurityHeader::FIXED_PART_SIZE + self.response.size()
+    }
+}
+
+impl<'de> Decode<'de> for AutoDetectRspPdu {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        let security_header = BasicSecurityHeader::decode(src)?;
+
+        if !security_header.flags.contains(BasicSecurityHeaderFlags::AUTODETECT_RSP) {
+            return Err(invalid_field_err!("securityHeader", "expected SEC_AUTODETECT_RSP flag", in: src));
+        }
+
+        let response = AutoDetectResponse::decode(src)?;
+
+        Ok(Self {
+            security_header,
+            response,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn req_pdu_round_trip() {
+        let original = AutoDetectReqPdu::new(AutoDetectRequest::RttRequest {
+            sequence_number: 7,
+            request_type: RTT_REQUEST_CONTINUOUS,
+        });
+        assert_eq!(original.security_header.flags, BasicSecurityHeaderFlags::AUTODETECT_REQ);
+
+        let encoded = ironrdp_core::encode_vec(&original).unwrap();
+        let decoded = ironrdp_core::decode::<AutoDetectReqPdu>(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn rsp_pdu_round_trip() {
+        let original = AutoDetectRspPdu::new(AutoDetectResponse::RttResponse { sequence_number: 7 });
+        assert_eq!(original.security_header.flags, BasicSecurityHeaderFlags::AUTODETECT_RSP);
+
+        let encoded = ironrdp_core::encode_vec(&original).unwrap();
+        let decoded = ironrdp_core::decode::<AutoDetectRspPdu>(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn req_pdu_rejects_response_flag() {
+        // A response-flagged frame must not decode as a request PDU.
+        let rsp = AutoDetectRspPdu::new(AutoDetectResponse::RttResponse { sequence_number: 1 });
+        let encoded = ironrdp_core::encode_vec(&rsp).unwrap();
+        assert!(ironrdp_core::decode::<AutoDetectReqPdu>(&encoded).is_err());
+    }
 
     // ========================================================================
     // Request encoding/decoding tests
@@ -731,6 +949,24 @@ mod tests {
         0x0A, 0x00, 0x00, 0x00, // baseRTT = 10
         0xE8, 0x03, 0x00, 0x00, // bandwidth = 1000
         0x14, 0x00, 0x00, 0x00, // averageRTT = 20
+    ];
+
+    const NETCHAR_RTT_WIRE: &[u8] = &[
+        0x0E, // headerLength
+        0x00, // headerTypeId
+        0x07, 0x00, // sequenceNumber = 7
+        0x40, 0x08, // requestType = NETCHAR_RESULT_RTT (0x0840)
+        0x08, 0x00, 0x00, 0x00, // baseRTT = 8
+        0x12, 0x00, 0x00, 0x00, // averageRTT = 18
+    ];
+
+    const NETCHAR_BW_RTT_WIRE: &[u8] = &[
+        0x0E, // headerLength
+        0x00, // headerTypeId
+        0x08, 0x00, // sequenceNumber = 8
+        0x80, 0x08, // requestType = NETCHAR_RESULT_BW_RTT (0x0880)
+        0xF4, 0x01, 0x00, 0x00, // bandwidth = 500
+        0x16, 0x00, 0x00, 0x00, // averageRTT = 22
     ];
 
     #[test]
@@ -873,6 +1109,48 @@ mod tests {
         let pdu = AutoDetectRequest::netchar_result(6, 10, 1000, 20);
         let encoded = ironrdp_core::encode_vec(&pdu).unwrap();
         assert_eq!(encoded.as_slice(), NETCHAR_ALL_WIRE);
+    }
+
+    #[test]
+    fn decode_netchar_rtt() {
+        let pdu = ironrdp_core::decode::<AutoDetectRequest>(NETCHAR_RTT_WIRE).unwrap();
+        match pdu {
+            AutoDetectRequest::NetworkCharacteristicsResult {
+                sequence_number,
+                request_type,
+                base_rtt_ms,
+                bandwidth_kbps,
+                average_rtt_ms,
+            } => {
+                assert_eq!(sequence_number, 7);
+                assert_eq!(request_type, NETCHAR_RESULT_RTT);
+                assert_eq!(base_rtt_ms, Some(8));
+                assert_eq!(bandwidth_kbps, None);
+                assert_eq!(average_rtt_ms, 18);
+            }
+            other => panic!("expected NetworkCharacteristicsResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_netchar_bw_rtt() {
+        let pdu = ironrdp_core::decode::<AutoDetectRequest>(NETCHAR_BW_RTT_WIRE).unwrap();
+        match pdu {
+            AutoDetectRequest::NetworkCharacteristicsResult {
+                sequence_number,
+                request_type,
+                base_rtt_ms,
+                bandwidth_kbps,
+                average_rtt_ms,
+            } => {
+                assert_eq!(sequence_number, 8);
+                assert_eq!(request_type, NETCHAR_RESULT_BW_RTT);
+                assert_eq!(base_rtt_ms, None);
+                assert_eq!(bandwidth_kbps, Some(500));
+                assert_eq!(average_rtt_ms, 22);
+            }
+            other => panic!("expected NetworkCharacteristicsResult, got {other:?}"),
+        }
     }
 
     #[test]

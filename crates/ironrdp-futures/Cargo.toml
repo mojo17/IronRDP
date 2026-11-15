@@ -1,10 +1,10 @@
 [package]
 name = "ironrdp-futures"
-version = "0.7.0"
+version = "0.10.0"
 readme = "README.md"
 description = "`Framed*` traits implementation above futures’s traits"
 edition.workspace = true
-rust-version = "1.89"
+rust-version = "1.94"
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -18,8 +18,7 @@ test = false
 
 [dependencies]
 futures-util = { version = "0.3", features = ["io"] } # public
-ironrdp-async = { path = "../ironrdp-async", version = "0.9" } # public
+ironrdp-async = { path = "../ironrdp-async", version = "0.12" } # public
 
 [lints]
 workspace = true
-

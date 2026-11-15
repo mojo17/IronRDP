@@ -1,10 +1,10 @@
 [package]
 name = "ironrdp-echo"
-version = "0.2.0"
+version = "0.6.0"
 readme = "README.md"
 description = "Virtual channel echo extension implementation"
 edition.workspace = true
-rust-version = "1.89"
+rust-version = "1.94"
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -17,9 +17,9 @@ doctest = false
 test = false
 
 [dependencies]
-ironrdp-core = { path = "../ironrdp-core", version = "0.2" } # public
-ironrdp-dvc = { path = "../ironrdp-dvc", version = "0.6" } # public
-ironrdp-pdu = { path = "../ironrdp-pdu", version = "0.8" } # public
+ironrdp-core = { path = "../ironrdp-core", version = "0.3" } # public
+ironrdp-dvc = { path = "../ironrdp-dvc", version = "0.10" } # public
+ironrdp-pdu = { path = "../ironrdp-pdu", version = "0.11" } # public
 tracing = { version = "0.1", features = ["log"] }
 
 [lints]

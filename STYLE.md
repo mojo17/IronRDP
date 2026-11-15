@@ -72,7 +72,7 @@ Exception: it’s not necessary when the type alias is clear enough (e.g.: `Conn
 
 A single sentence which:
 - is short and concise,
-- does not start by a capital letter, and
+- does not capitalize a word solely because it appears at the start of a sentence
 - does not contain trailing punctuation.
 
 This is the convention adopted by the Rust project:
@@ -84,9 +84,11 @@ Also, use proper abbreviation casing, e.g., IPv4 and IPv6 (not ipv4/ipv6).
 ```rust
 // GOOD
 "invalid X.509 certificate"
+"DIB decode error"
 
 // BAD
 "Invalid X.509 certificate."
+"dib decode error"
 ```
 
 **Rationale**: it’s easier to compose with other error messages. 
@@ -104,6 +106,71 @@ The error reporter (e.g.: `ironrdp_error::ErrorReport`) is responsible for addin
 
 [api-guidelines-errors]: https://rust-lang.github.io/api-guidelines/interoperability.html#error-types-are-meaningful-and-well-behaved-c-good-err
 [std-error-trait]: https://doc.rust-lang.org/stable/std/error/trait.Error.html
+
+### Choosing an error kind
+
+The structured `DecodeErrorKind` / `EncodeErrorKind` variants (`NotEnoughBytes`,
+`InvalidField`, `UnexpectedMessageType`, `UnsupportedVersion`, `UnsupportedValue`)
+carry the byte offset of the failure. Construct them through the dedicated macros
+(`invalid_field_err!`, `unexpected_message_type_err!`, `unsupported_version_err!`,
+`unsupported_value_err!`) with `in: src` so the cursor position is captured.
+
+Reserve `Other` for failures outside stream processing: constructors, integer
+conversions, state validation. It is the only offset-less variant, by design.
+
+```rust
+// GOOD
+return Err(invalid_field_err!("channelCount", "too many channels", in: src));
+
+// BAD: the offset is lost, and the report cannot say where decoding failed
+return Err(DecodeError::new("ChannelDef", DecodeErrorKind::Other { description: "too many channels" }));
+```
+
+**Rationale:** offsets make malformed-PDU reports and fuzz crash replays
+actionable; a bare `Other` on a decode path throws that information away.
+
+### Error types
+
+Library crates expose typed errors (`ironrdp_error::Error<Kind>` and the per-crate
+kind enums), not `anyhow`. Core-tier crates do not use proc-macro error derives
+(no `thiserror`): hand-roll the `Display` and `Error` implementations, following
+`ironrdp-error`'s own pattern (its `Source` captures `core::panic::Location` via
+`#[track_caller]` and renders it in `Display`).
+
+**Rationale:** keeps `syn` and friends out of the core build graph; the hand-rolled
+pattern costs a few lines once and nothing thereafter.
+
+### Decoding unknown values
+
+Wire formats grow. When a decoder meets a value the current flag or constant list
+does not define, the handling depends on what the field IS:
+
+- **Peer advertisements** (capability flags, option masks, supported-feature bit
+  sets): decode with `from_bits_retain`. Unknown bits are kept, never dropped and
+  never fatal, so re-encoding reproduces the wire bytes and a peer newer than this
+  library is not refused.
+- **Negotiation outputs the receiver must implement** (for example, the server's
+  selected encryption method): strict. An unknown selection cannot be honored, and
+  a conforming peer cannot produce one.
+- **Structural discriminants** (PDU types, event codes): strict, matching the
+  specifications' own drop-the-connection language for unknown structures.
+
+```rust
+// GOOD: advertisement mask; the receiver acts only on the bits it knows
+let options = ChannelOptions::from_bits_retain(src.read_u32());
+
+// BAD: rejects any peer that sets a bit added to the protocol after this
+// list was written
+let options = ChannelOptions::from_bits(src.read_u32())
+    .ok_or_else(|| invalid_field_err!("options", "invalid channel options", in: src))?;
+```
+
+**Rationale:** the RDP specifications routinely extend flag lists, and several
+flags are explicitly documented as "MUST be ignored" by the receiver. Validating
+advertisement bits turns forward compatibility into a connection failure, and
+`from_bits_retain` (rather than `from_bits_truncate`) additionally preserves the
+decode -> encode round-trip byte-for-byte, which replay tooling and the round-trip
+fuzz oracles rely on.
 
 ## Logging
 
@@ -150,6 +217,34 @@ error!(%err, "Active stage failed");
 
 **Rationale**: consistency.
 We can rely on this to filter and collect diagnostics.
+
+### Log levels
+
+Choose a level by how often the event fires and who needs it, keeping in mind that
+IronRDP crates are libraries embedded into a final client which owns the default
+verbosity. The final consumer should not be flooded at default level by routine
+protocol mechanics.
+
+- `info!`: reserved for **rare lifecycle milestones** a consumer would typically want
+  at default verbosity (e.g. connection or session lifecycle transitions). It should
+  be uncommon in a library, and never used for anything that repeats during normal
+  operation (per copy/paste, per lock/unlock, per frame, etc.).
+- `debug!`: **significant one-off events** — nothing that repeats in abundance, and no
+  "entering function X" tracing.
+- `trace!`: everything else, the fine-grained detail you only want when that is all
+  that is left to understand a problem.
+
+```rust
+// GOOD: a rare lifecycle milestone the consumer wants by default.
+info!(%server_addr, "Connection established");
+
+// BAD: fires on every clipboard lock/unlock — routine mechanics belong at debug!/trace!.
+info!(count = cleared.len(), "Releasing outgoing locks before taking clipboard ownership");
+```
+
+**Rationale**: the binary at the top of the stack decides what to surface to the user;
+a library that emits `info!` for routine operations takes that choice away and spams
+default logs.
 
 [tracing-fields]: https://docs.rs/tracing/latest/tracing/index.html#recording-fields
 
@@ -286,6 +381,7 @@ Exception: no period for brief comments (e.g., `// VER`, `// RSV`, `// ATYP`)
 
 For `.md` and `.adoc` files, prefer a sentence-per-line format, don't wrap lines.
 If the line is too long, you want to split the sentence in two.
+Code comments and doc comments follow the same rule, except that a sentence wraps where it would exceed the line-length limit.
 
 **Rationale:** much easier to edit the text and read the diff, see [this link][asciidoctor-practices].
 

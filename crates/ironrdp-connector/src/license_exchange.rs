@@ -10,8 +10,10 @@ use ironrdp_pdu::rdp::server_license::{self, LicenseInformation, LicensePdu, Ser
 use rand::RngCore as _;
 use tracing::{debug, error, info, trace};
 
-use super::{ConnectorError, ConnectorErrorExt as _, custom_err, general_err, legacy};
-use crate::{ConnectorResult, ConnectorResultExt as _, Sequence, State, Written, encode_send_data_request};
+use super::{ConnectorError, ConnectorErrorExt as _, custom_err, general_err};
+use crate::{
+    ConnectorResult, ConnectorResultExt as _, MonotonicInstant, Sequence, State, Written, encode_send_data_request,
+};
 
 #[derive(Default, Debug)]
 #[non_exhaustive]
@@ -117,7 +119,12 @@ impl Sequence for LicenseExchangeSequence {
         &self.state
     }
 
-    fn step(&mut self, input: &[u8], output: &mut WriteBuf) -> ConnectorResult<Written> {
+    fn step(
+        &mut self,
+        input: &[u8],
+        _received_at: Option<MonotonicInstant>,
+        output: &mut WriteBuf,
+    ) -> ConnectorResult<Written> {
         let (written, next_state) = match mem::take(&mut self.state) {
             LicenseExchangeState::Consumed => {
                 return Err(general_err!(
@@ -126,9 +133,11 @@ impl Sequence for LicenseExchangeSequence {
             }
 
             LicenseExchangeState::NewLicenseRequest => {
-                let send_data_indication_ctx = legacy::decode_send_data_indication(input)?;
+                let send_data_indication_ctx =
+                    ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
                 let license_pdu = send_data_indication_ctx
                     .decode_user_data::<LicensePdu>()
+                    .map_err(ConnectorError::decode)
                     .with_context("decode during LicenseExchangeState::NewLicenseRequest")?;
 
                 match license_pdu {
@@ -258,10 +267,12 @@ impl Sequence for LicenseExchangeSequence {
             }
 
             LicenseExchangeState::PlatformChallenge { encryption_data } => {
-                let send_data_indication_ctx = legacy::decode_send_data_indication(input)?;
+                let send_data_indication_ctx =
+                    ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
 
                 let license_pdu = send_data_indication_ctx
                     .decode_user_data::<LicensePdu>()
+                    .map_err(ConnectorError::decode)
                     .with_context("decode during LicenseExchangeState::PlatformChallenge")?;
 
                 match license_pdu {
@@ -310,10 +321,12 @@ impl Sequence for LicenseExchangeSequence {
             }
 
             LicenseExchangeState::UpgradeLicense { encryption_data } => {
-                let send_data_indication_ctx = legacy::decode_send_data_indication(input)?;
+                let send_data_indication_ctx =
+                    ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
 
                 let license_pdu = send_data_indication_ctx
                     .decode_user_data::<LicensePdu>()
+                    .map_err(ConnectorError::decode)
                     .with_context("decode during SERVER_NEW_LICENSE/LicenseExchangeState::UpgradeLicense")?;
 
                 match license_pdu {

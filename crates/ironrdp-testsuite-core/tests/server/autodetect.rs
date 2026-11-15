@@ -1,11 +1,51 @@
-use ironrdp_pdu::rdp::autodetect::AutoDetectResponse;
-use ironrdp_server::autodetect::AutoDetectManager;
+use ironrdp_pdu::rdp::autodetect::{AutoDetectRequest, AutoDetectResponse};
+use ironrdp_server::autodetect::{AutoDetectManager, AutoDetectOutcome};
+
+/// The smallest graphics write the server brackets with a bandwidth measurement, 10 KiB.
+/// Mirrors a tuning constant that is not public, so retuning it must update this test.
+const BW_BRACKET_MIN_BYTES: usize = 10 * 1024;
+
+/// Upper bound on ticks to drive while waiting for a bandwidth transaction:
+/// generous enough to cover the pacing plus the window, tight enough that a
+/// regression that stops `build_bandwidth_measure` from ever completing a
+/// transaction fails the test instead of hanging CI.
+const MAX_BANDWIDTH_TICKS: usize = 64;
+
+/// Drives `build_bandwidth_measure` until it has produced both a Start and a
+/// Stop, asserting the transaction shape along the way: exactly those two
+/// PDUs, sharing one sequence number, with nothing in between. Pinning the
+/// PDU types here is what would have caught a synthetic payload PDU sent
+/// between them, which is off-spec for continuous detection per
+/// [MS-RDPBCGR] 1.3.9. Returns the transaction's sequence number.
+fn drive_bandwidth_start_and_stop(mgr: &mut AutoDetectManager) -> u16 {
+    let mut start_sequence = None;
+    for _ in 0..MAX_BANDWIDTH_TICKS {
+        let Some(pdu) = mgr.build_bandwidth_measure() else {
+            continue;
+        };
+        match (start_sequence, pdu) {
+            (None, AutoDetectRequest::BandwidthMeasureStart { sequence_number, .. }) => {
+                start_sequence = Some(sequence_number);
+            }
+            (Some(start), AutoDetectRequest::BandwidthMeasureStop { sequence_number, .. }) => {
+                assert_eq!(
+                    sequence_number, start,
+                    "Start and Stop must share the transaction sequence"
+                );
+                return start;
+            }
+            (None, other) => panic!("expected Start first, got {other:?}"),
+            (Some(_), other) => panic!("expected Stop after Start, got {other:?}"),
+        }
+    }
+    panic!("bandwidth transaction did not complete within {MAX_BANDWIDTH_TICKS} ticks");
+}
 
 #[test]
 fn rtt_request_increments_sequence() {
     let mut mgr = AutoDetectManager::new();
-    let req1 = mgr.send_rtt_request();
-    let req2 = mgr.send_rtt_request();
+    let req1 = mgr.send_rtt_request(0);
+    let req2 = mgr.send_rtt_request(0);
     assert_eq!(req1.sequence_number(), 0);
     assert_eq!(req2.sequence_number(), 1);
     assert_eq!(mgr.pending_count(), 2);
@@ -14,23 +54,24 @@ fn rtt_request_increments_sequence() {
 #[test]
 fn rtt_response_returns_latency() {
     let mut mgr = AutoDetectManager::new();
-    let req = mgr.send_rtt_request();
+    let req = mgr.send_rtt_request(0);
 
     let response = AutoDetectResponse::RttResponse {
         sequence_number: req.sequence_number(),
     };
-    let rtt = mgr.handle_response(&response);
-    assert!(rtt.is_some(), "should match the outstanding probe");
+    // Both timestamps come from the caller, so the measurement is exact rather than
+    // dependent on how fast the test happens to run.
+    assert_eq!(mgr.handle_response(&response, 20), AutoDetectOutcome::Rtt(20));
     assert_eq!(mgr.pending_count(), 0);
 }
 
 #[test]
 fn unknown_sequence_returns_none() {
     let mut mgr = AutoDetectManager::new();
-    let _ = mgr.send_rtt_request();
+    let _ = mgr.send_rtt_request(0);
 
     let response = AutoDetectResponse::RttResponse { sequence_number: 999 };
-    assert!(mgr.handle_response(&response).is_none());
+    assert_eq!(mgr.handle_response(&response, 20), AutoDetectOutcome::Unmatched);
     assert_eq!(mgr.pending_count(), 1, "original probe should remain");
 }
 
@@ -44,18 +85,509 @@ fn snapshot_none_without_measurements() {
 fn snapshot_reflects_measurements() {
     let mut mgr = AutoDetectManager::new();
 
-    for _ in 0..3 {
-        let req = mgr.send_rtt_request();
+    for (sent_at, rtt) in [(0u64, 10u64), (100, 20), (200, 30)] {
+        let req = mgr.send_rtt_request(sent_at);
         let response = AutoDetectResponse::RttResponse {
             sequence_number: req.sequence_number(),
         };
-        let _ = mgr.handle_response(&response);
+        let _ = mgr.handle_response(&response, sent_at + rtt);
     }
 
     let snap = mgr.snapshot().expect("should have data");
     assert_eq!(snap.sample_count, 3);
-    // RTT should be ~0ms (same-process send/receive)
-    assert!(snap.avg_ms < 100);
+    assert_eq!(snap.min_ms, 10);
+    assert_eq!(snap.max_ms, 30);
+    assert_eq!(snap.avg_ms, 20);
+}
+
+/// A caller whose clock ran backwards between the request and the response must
+/// produce a zero sample. Wrapping subtraction here would yield a value near
+/// `u32::MAX` and poison every statistic drawn from the window.
+#[test]
+fn backwards_clock_yields_a_zero_sample() {
+    let mut mgr = AutoDetectManager::new();
+    let req = mgr.send_rtt_request(1000);
+
+    let response = AutoDetectResponse::RttResponse {
+        sequence_number: req.sequence_number(),
+    };
+    assert_eq!(mgr.handle_response(&response, 400), AutoDetectOutcome::Rtt(0));
+
+    // The zero has to reach the window, not just the return value, since the
+    // snapshot is what the peer eventually sees.
+    let snap = mgr.snapshot().expect("one measurement was recorded");
+    assert_eq!(snap.min_ms, 0);
+    assert_eq!(snap.max_ms, 0);
+    assert_eq!(snap.avg_ms, 0);
+}
+
+/// The same backwards clock reaches expiry, where the saturation has the opposite
+/// shape: an age of zero is below any maximum, so the probe stays pending.
+/// Wrapping subtraction would make it look older than any limit and drop a probe
+/// whose response is still in flight.
+#[test]
+fn backwards_clock_keeps_the_probe_pending() {
+    let mut mgr = AutoDetectManager::new();
+    let _ = mgr.send_rtt_request(1000);
+
+    mgr.expire_stale_probes(400, 100);
+    assert_eq!(mgr.pending_count(), 1, "a probe from the future is not stale");
+}
+
+/// A gap wider than `u32::MAX` milliseconds (about 49.7 days) clamps rather than
+/// truncating to the low 32 bits, which would report a small RTT for an enormous one.
+#[test]
+fn an_enormous_gap_clamps_to_u32_max() {
+    let mut mgr = AutoDetectManager::new();
+    let req = mgr.send_rtt_request(0);
+
+    let response = AutoDetectResponse::RttResponse {
+        sequence_number: req.sequence_number(),
+    };
+    assert_eq!(
+        mgr.handle_response(&response, u64::from(u32::MAX) + 1),
+        AutoDetectOutcome::Rtt(u32::MAX)
+    );
+}
+
+#[test]
+fn netchar_result_none_without_measurements() {
+    let mut mgr = AutoDetectManager::new();
+    assert!(
+        mgr.build_netchar_result(0).is_none(),
+        "no result should be produced before the network has been characterised"
+    );
+}
+
+#[test]
+fn netchar_result_withheld_until_bandwidth_is_known() {
+    let mut mgr = AutoDetectManager::new();
+
+    for _ in 0..3 {
+        let req = mgr.send_rtt_request(0);
+        let response = AutoDetectResponse::RttResponse {
+            sequence_number: req.sequence_number(),
+        };
+        let _ = mgr.handle_response(&response, 20);
+    }
+
+    assert!(mgr.snapshot().is_some(), "RTT samples were recorded");
+    assert!(
+        mgr.build_netchar_result(20).is_none(),
+        "RTT without a bandwidth measurement is not a characterisation of the network"
+    );
+}
+
+#[test]
+fn bandwidth_measure_transacts_and_enables_netchar() {
+    let mut mgr = AutoDetectManager::new();
+    let req = mgr.send_rtt_request(0);
+    let _ = mgr.handle_response(
+        &AutoDetectResponse::RttResponse {
+            sequence_number: req.sequence_number(),
+        },
+        20,
+    );
+
+    let bw_seq = drive_bandwidth_start_and_stop(&mut mgr);
+    let results = AutoDetectResponse::BandwidthMeasureResults {
+        sequence_number: bw_seq,
+        response_type: ironrdp_pdu::rdp::autodetect::BW_RESULTS_CONTINUOUS,
+        time_delta_ms: 10,
+        byte_count: 100_000,
+    };
+    assert_eq!(
+        mgr.handle_response(&results, 20),
+        AutoDetectOutcome::Bandwidth(Some(80_000))
+    );
+
+    match mgr
+        .build_netchar_result(20)
+        .expect("result once RTT and bandwidth are known")
+    {
+        AutoDetectRequest::NetworkCharacteristicsResult { bandwidth_kbps, .. } => {
+            assert_eq!(bandwidth_kbps, Some(80_000), "byte_count * 8 / time_delta_ms");
+        }
+        other => panic!("expected NetworkCharacteristicsResult, got {other:?}"),
+    }
+}
+
+#[test]
+fn bandwidth_kbps_reflects_the_last_completed_measurement() {
+    let mut mgr = AutoDetectManager::new();
+    assert!(mgr.bandwidth_kbps().is_none(), "nothing measured yet");
+
+    let bw_seq = drive_bandwidth_start_and_stop(&mut mgr);
+    let results = AutoDetectResponse::BandwidthMeasureResults {
+        sequence_number: bw_seq,
+        response_type: ironrdp_pdu::rdp::autodetect::BW_RESULTS_CONTINUOUS,
+        time_delta_ms: 10,
+        byte_count: 100_000,
+    };
+    assert_eq!(
+        mgr.handle_response(&results, 20),
+        AutoDetectOutcome::Bandwidth(Some(80_000))
+    );
+
+    assert_eq!(mgr.bandwidth_kbps(), Some(80_000), "byte_count * 8 / time_delta_ms");
+}
+
+/// A second call to `build_bandwidth_measure` after Stop has been sent, while
+/// the client's Bandwidth Measure Results is still outstanding, must not
+/// start a new transaction. `drive_bandwidth_start_and_stop` already pins
+/// that nothing is sent between Start and Stop themselves; this covers the
+/// phase after Stop that it does not drive into.
+#[test]
+fn a_second_measurement_does_not_start_while_awaiting_results() {
+    let mut mgr = AutoDetectManager::new();
+    let _ = drive_bandwidth_start_and_stop(&mut mgr);
+
+    for _ in 0..MAX_BANDWIDTH_TICKS {
+        assert!(
+            mgr.build_bandwidth_measure().is_none(),
+            "no new transaction while the prior one awaits results"
+        );
+    }
+}
+
+/// A Bandwidth Measure Results whose sequence number does not match the
+/// outstanding transaction must be ignored: no bandwidth recorded, and the
+/// transaction stays outstanding rather than being cleared by an unrelated
+/// reply.
+#[test]
+fn mismatched_bandwidth_sequence_is_ignored() {
+    let mut mgr = AutoDetectManager::new();
+    let req = mgr.send_rtt_request(0);
+    let _ = mgr.handle_response(
+        &AutoDetectResponse::RttResponse {
+            sequence_number: req.sequence_number(),
+        },
+        20,
+    );
+    let bw_seq = drive_bandwidth_start_and_stop(&mut mgr);
+
+    // A reply for a different sequence must not be treated as completing the
+    // outstanding transaction.
+    let mismatched = AutoDetectResponse::BandwidthMeasureResults {
+        sequence_number: bw_seq.wrapping_add(1),
+        response_type: ironrdp_pdu::rdp::autodetect::BW_RESULTS_CONTINUOUS,
+        time_delta_ms: 10,
+        byte_count: 100_000,
+    };
+    assert_eq!(mgr.handle_response(&mismatched, 20), AutoDetectOutcome::Unmatched);
+    assert!(
+        mgr.build_netchar_result(1_000).is_none(),
+        "a mismatched reply must not have recorded a bandwidth figure"
+    );
+
+    // The real transaction is still outstanding, so its own reply still
+    // completes it. If the mismatched reply above had been accepted, this
+    // second reply would find no outstanding transaction to match and the
+    // measurement would never complete.
+    let matching = AutoDetectResponse::BandwidthMeasureResults {
+        sequence_number: bw_seq,
+        response_type: ironrdp_pdu::rdp::autodetect::BW_RESULTS_CONTINUOUS,
+        time_delta_ms: 10,
+        byte_count: 100_000,
+    };
+    assert_eq!(
+        mgr.handle_response(&matching, 20),
+        AutoDetectOutcome::Bandwidth(Some(80_000))
+    );
+    assert!(
+        mgr.build_netchar_result(1_000).is_some(),
+        "the outstanding transaction's own reply must still complete it"
+    );
+}
+
+/// A Bandwidth Measure Results in which the client counted no bytes carries no
+/// figure. It must not be reported, and it must not leave a stale
+/// `bandwidth_kbps` from an earlier successful measurement on the wire as if
+/// it were current.
+#[test]
+fn zero_byte_count_ages_out_a_previous_bandwidth_figure() {
+    let mut mgr = AutoDetectManager::new();
+    let req = mgr.send_rtt_request(0);
+    let _ = mgr.handle_response(
+        &AutoDetectResponse::RttResponse {
+            sequence_number: req.sequence_number(),
+        },
+        20,
+    );
+
+    // First measurement succeeds.
+    let bw_seq = drive_bandwidth_start_and_stop(&mut mgr);
+    let good_results = AutoDetectResponse::BandwidthMeasureResults {
+        sequence_number: bw_seq,
+        response_type: ironrdp_pdu::rdp::autodetect::BW_RESULTS_CONTINUOUS,
+        time_delta_ms: 10,
+        byte_count: 100_000,
+    };
+    assert_eq!(
+        mgr.handle_response(&good_results, 20),
+        AutoDetectOutcome::Bandwidth(Some(80_000))
+    );
+    assert!(
+        mgr.build_netchar_result(1_000).is_some(),
+        "a real bandwidth figure is known"
+    );
+
+    // Second measurement fails: no bytes counted.
+    let req = mgr.send_rtt_request(1_000);
+    let _ = mgr.handle_response(
+        &AutoDetectResponse::RttResponse {
+            sequence_number: req.sequence_number(),
+        },
+        1_020,
+    );
+    let bw_seq = drive_bandwidth_start_and_stop(&mut mgr);
+    let zero_delta_results = AutoDetectResponse::BandwidthMeasureResults {
+        sequence_number: bw_seq,
+        response_type: ironrdp_pdu::rdp::autodetect::BW_RESULTS_CONTINUOUS,
+        time_delta_ms: 10,
+        byte_count: 0,
+    };
+    // Matched (it completes the outstanding transaction), but unusable: distinct from
+    // an unmatched reply, and distinct from `Bandwidth(Some(_))`. A caller collapsing
+    // this into "no measurement happened" would miss that the manager just cleared its
+    // own figure right here.
+    assert_eq!(
+        mgr.handle_response(&zero_delta_results, 1_020),
+        AutoDetectOutcome::Bandwidth(None)
+    );
+
+    // The RTT sample is fresh, but the old bandwidth figure must not ride
+    // along as though it were still current.
+    assert!(
+        mgr.build_netchar_result(2_000).is_none(),
+        "the aged-out bandwidth figure must withhold the result, not report the stale one"
+    );
+}
+
+/// The client times the window in whole milliseconds, so a burst that crosses a
+/// fast link within one reports zero. That is a measurement bounded by one
+/// millisecond, not a failure.
+#[test]
+fn zero_time_delta_counts_as_one_millisecond() {
+    let mut mgr = AutoDetectManager::new();
+    let bw_seq = drive_bandwidth_start_and_stop(&mut mgr);
+    let results = AutoDetectResponse::BandwidthMeasureResults {
+        sequence_number: bw_seq,
+        response_type: ironrdp_pdu::rdp::autodetect::BW_RESULTS_CONTINUOUS,
+        time_delta_ms: 0,
+        byte_count: 100_000,
+    };
+    assert_eq!(
+        mgr.handle_response(&results, 20),
+        AutoDetectOutcome::Bandwidth(Some(800_000))
+    );
+}
+
+/// The client supplies both numbers, so a figure that doesn't fit in 32 bits
+/// saturates at `u32::MAX` instead of wrapping to a small value.
+#[test]
+fn an_oversized_bandwidth_figure_saturates() {
+    let mut mgr = AutoDetectManager::new();
+    let bw_seq = drive_bandwidth_start_and_stop(&mut mgr);
+    let results = AutoDetectResponse::BandwidthMeasureResults {
+        sequence_number: bw_seq,
+        response_type: ironrdp_pdu::rdp::autodetect::BW_RESULTS_CONTINUOUS,
+        time_delta_ms: 1,
+        byte_count: u32::MAX,
+    };
+    assert_eq!(
+        mgr.handle_response(&results, 20),
+        AutoDetectOutcome::Bandwidth(Some(u32::MAX))
+    );
+}
+
+/// Answers the measurement with `sequence_number` with a usable figure.
+fn answer_bracket(mgr: &mut AutoDetectManager, sequence_number: u16, now_ms: u64) {
+    let results = AutoDetectResponse::BandwidthMeasureResults {
+        sequence_number,
+        response_type: ironrdp_pdu::rdp::autodetect::BW_RESULTS_CONTINUOUS,
+        time_delta_ms: 2,
+        byte_count: 20_000,
+    };
+    assert_eq!(
+        mgr.handle_response(&results, now_ms),
+        AutoDetectOutcome::Bandwidth(Some(80_000))
+    );
+}
+
+/// Completes the bracketed measurement `start` opened, with a usable figure.
+fn complete_bracket(mgr: &mut AutoDetectManager, start: &AutoDetectRequest, now_ms: u64) {
+    let stop = mgr.end_bandwidth_measure().expect("Stop after a bracketed Start");
+    assert_eq!(stop.sequence_number(), start.sequence_number());
+    answer_bracket(mgr, stop.sequence_number(), now_ms);
+}
+
+#[test]
+fn a_large_write_is_bracketed_by_start_and_stop() {
+    let mut mgr = AutoDetectManager::new();
+    let start = mgr
+        .begin_bandwidth_measure(BW_BRACKET_MIN_BYTES, 0)
+        .expect("a write at the threshold is measured");
+    assert!(matches!(start, AutoDetectRequest::BandwidthMeasureStart { .. }));
+    let stop = mgr.end_bandwidth_measure().expect("Stop follows the write");
+    assert!(matches!(stop, AutoDetectRequest::BandwidthMeasureStop { .. }));
+    assert_eq!(stop.sequence_number(), start.sequence_number());
+    assert!(mgr.end_bandwidth_measure().is_none(), "one Stop per Start");
+}
+
+#[test]
+fn a_small_write_is_not_bracketed() {
+    let mut mgr = AutoDetectManager::new();
+    assert!(mgr.begin_bandwidth_measure(BW_BRACKET_MIN_BYTES - 1, 0).is_none());
+    assert!(mgr.end_bandwidth_measure().is_none());
+}
+
+#[test]
+fn bracketed_measurements_are_paced_and_never_overlap() {
+    let mut mgr = AutoDetectManager::new();
+    let start = mgr.begin_bandwidth_measure(64 * 1024, 0).expect("first write measured");
+    let _ = mgr.end_bandwidth_measure();
+    assert!(
+        mgr.begin_bandwidth_measure(64 * 1024, 5_000).is_none(),
+        "no new measurement while the client's results are outstanding"
+    );
+    answer_bracket(&mut mgr, start.sequence_number(), 10);
+    assert!(
+        mgr.begin_bandwidth_measure(64 * 1024, 999).is_none(),
+        "within a second of the previous Start"
+    );
+    let next = mgr.begin_bandwidth_measure(64 * 1024, 1_000).expect("a second later");
+    complete_bracket(&mut mgr, &next, 1_010);
+}
+
+/// While large writes keep coming, the tick window (which times idle stretches
+/// as well as traffic) stays closed.
+#[test]
+fn the_tick_window_stays_closed_while_brackets_recur() {
+    let mut mgr = AutoDetectManager::new();
+    for round in 0..16u64 {
+        let now_ms = round * 1_000;
+        let start = mgr.begin_bandwidth_measure(64 * 1024, now_ms).expect("measured");
+        complete_bracket(&mut mgr, &start, now_ms + 10);
+        for _ in 0..4 {
+            assert!(mgr.build_bandwidth_measure().is_none());
+        }
+    }
+}
+
+/// A session that stops sending large writes, such as one whose only large
+/// frame was the initial render, goes back to the tick window rather than
+/// keeping the last bracketed figure forever.
+#[test]
+fn the_tick_window_resumes_when_brackets_stop() {
+    let mut mgr = AutoDetectManager::new();
+    let start = mgr.begin_bandwidth_measure(64 * 1024, 0).expect("measured");
+    complete_bracket(&mut mgr, &start, 10);
+    assert!(
+        mgr.build_bandwidth_measure().is_none(),
+        "not on the tick right after a bracket"
+    );
+    drive_bandwidth_start_and_stop(&mut mgr);
+}
+
+/// A bracketed Start whose Stop is never sent does not block bandwidth
+/// measurement for the rest of the session.
+#[test]
+fn an_unended_bracket_expires() {
+    let mut mgr = AutoDetectManager::new();
+    let _ = mgr.begin_bandwidth_measure(64 * 1024, 0).expect("measured");
+    mgr.expire_stale_probes(29_999, 30_000);
+    assert!(
+        mgr.begin_bandwidth_measure(64 * 1024, 29_999).is_none(),
+        "still pending before the maximum age"
+    );
+    mgr.expire_stale_probes(30_000, 30_000);
+    let next = mgr
+        .begin_bandwidth_measure(64 * 1024, 30_000)
+        .expect("a new bracket once the stale one expired");
+    complete_bracket(&mut mgr, &next, 30_010);
+}
+
+/// A Stop the client never answers does not block bandwidth measurement for
+/// the rest of the session, and results that arrive after it expired are not
+/// taken as a measurement.
+#[test]
+fn an_unanswered_measurement_expires() {
+    let mut mgr = AutoDetectManager::new();
+    let sequence = drive_bandwidth_start_and_stop(&mut mgr);
+    // The tick has no clock, so the first expiry pass stamps the measurement.
+    mgr.expire_stale_probes(1_000, 30_000);
+    mgr.expire_stale_probes(30_999, 30_000);
+    assert!(
+        mgr.begin_bandwidth_measure(64 * 1024, 30_999).is_none(),
+        "still pending before the maximum age"
+    );
+    mgr.expire_stale_probes(31_000, 30_000);
+    let late = AutoDetectResponse::BandwidthMeasureResults {
+        sequence_number: sequence,
+        response_type: ironrdp_pdu::rdp::autodetect::BW_RESULTS_CONTINUOUS,
+        time_delta_ms: 2,
+        byte_count: 20_000,
+    };
+    assert_eq!(mgr.handle_response(&late, 31_010), AutoDetectOutcome::Unmatched);
+    drive_bandwidth_start_and_stop(&mut mgr);
+}
+
+/// A tick window stays open across ticks however far apart they are: only the
+/// wait for results after its Stop is timed.
+#[test]
+fn a_slow_tick_window_is_not_cut_short() {
+    let mut mgr = AutoDetectManager::new();
+    let mut now_ms = 0;
+    let mut start_sequence = None;
+    for _ in 0..MAX_BANDWIDTH_TICKS {
+        now_ms += 20_000;
+        mgr.expire_stale_probes(now_ms, 30_000);
+        match (start_sequence, mgr.build_bandwidth_measure()) {
+            (_, None) => {}
+            (None, Some(AutoDetectRequest::BandwidthMeasureStart { sequence_number, .. })) => {
+                start_sequence = Some(sequence_number);
+            }
+            (Some(start), Some(AutoDetectRequest::BandwidthMeasureStop { sequence_number, .. })) => {
+                assert_eq!(sequence_number, start);
+                return;
+            }
+            (_, Some(other)) => panic!("unexpected {other:?}"),
+        }
+    }
+    panic!("the tick window never sent its Stop");
+}
+
+/// Two consecutive measurements landing on the identical kbps figure (plausible on a
+/// stable link) must both be reported as a match. A caller that derives "did this
+/// complete a measurement" from comparing the value before and after the call, rather
+/// than from `handle_response`'s own return value, would see no change on the second
+/// one and misclassify a real match as unmatched.
+#[test]
+fn identical_consecutive_bandwidth_measurements_are_both_reported_as_matched() {
+    let mut mgr = AutoDetectManager::new();
+    let req = mgr.send_rtt_request(0);
+    let _ = mgr.handle_response(
+        &AutoDetectResponse::RttResponse {
+            sequence_number: req.sequence_number(),
+        },
+        20,
+    );
+
+    for now_ms in [20u64, 1_020] {
+        let bw_seq = drive_bandwidth_start_and_stop(&mut mgr);
+        let results = AutoDetectResponse::BandwidthMeasureResults {
+            sequence_number: bw_seq,
+            response_type: ironrdp_pdu::rdp::autodetect::BW_RESULTS_CONTINUOUS,
+            time_delta_ms: 10,
+            byte_count: 100_000,
+        };
+        assert_eq!(
+            mgr.handle_response(&results, now_ms),
+            AutoDetectOutcome::Bandwidth(Some(80_000)),
+            "the same kbps figure twice in a row is still a match, not a repeat of nothing"
+        );
+    }
 }
 
 #[test]
@@ -64,25 +596,288 @@ fn sequence_number_wraps_at_u16_max() {
     // Advance sequence counter through all values, resolving each probe immediately
     // to avoid growing pending_probes to 65k entries.
     for _ in 0..u16::MAX {
-        let req = mgr.send_rtt_request();
+        let req = mgr.send_rtt_request(0);
         let response = AutoDetectResponse::RttResponse {
             sequence_number: req.sequence_number(),
         };
-        let _ = mgr.handle_response(&response);
+        let _ = mgr.handle_response(&response, 20);
     }
-    let req = mgr.send_rtt_request();
+    let req = mgr.send_rtt_request(0);
     assert_eq!(req.sequence_number(), u16::MAX);
 
-    let req2 = mgr.send_rtt_request();
+    let req2 = mgr.send_rtt_request(0);
     assert_eq!(req2.sequence_number(), 0, "should wrap around");
+}
+
+/// New handles read as "not measured yet": the sentinel for every figure and
+/// generation 0.
+#[test]
+fn autodetect_handles_default_to_no_measurement() {
+    use core::sync::atomic::Ordering;
+
+    use ironrdp_server::autodetect::AutoDetectHandles;
+
+    let handles = AutoDetectHandles::default();
+    assert_eq!(handles.rtt.load(Ordering::Relaxed), u32::MAX);
+    assert_eq!(handles.baseline_rtt.load(Ordering::Relaxed), u32::MAX);
+    assert_eq!(handles.bandwidth.load(Ordering::Relaxed), u32::MAX);
+    assert_eq!(handles.bandwidth_generation.load(Ordering::Acquire), 0);
 }
 
 #[test]
 fn stale_probe_expiry() {
     let mut mgr = AutoDetectManager::new();
-    let _ = mgr.send_rtt_request();
+    let _ = mgr.send_rtt_request(0);
     assert_eq!(mgr.pending_count(), 1);
 
-    mgr.expire_stale_probes(core::time::Duration::ZERO);
+    mgr.expire_stale_probes(1, 0);
     assert_eq!(mgr.pending_count(), 0);
+}
+
+/// Mirrors the crate-private `NETCHAR_RESULT_MIN_INTERVAL_MS`, which is not
+/// reachable across the crate boundary.
+const NETCHAR_RESULT_INTERVAL_MS: u64 = 1_000;
+
+/// Mirrors the crate-private `RTT_WINDOW_SIZE`.
+const RTT_WINDOW: usize = 8;
+
+/// The result is paced on its own clock, not on the probe cadence: a caller
+/// probing far faster than the interval still emits at most one per interval.
+#[test]
+fn netchar_result_is_paced_independently_of_the_probe_cadence() {
+    let mut mgr = AutoDetectManager::new();
+
+    let req = mgr.send_rtt_request(0);
+    let response = AutoDetectResponse::RttResponse {
+        sequence_number: req.sequence_number(),
+    };
+    let _ = mgr.handle_response(&response, 20);
+
+    let bw_seq = drive_bandwidth_start_and_stop(&mut mgr);
+    let results = AutoDetectResponse::BandwidthMeasureResults {
+        sequence_number: bw_seq,
+        response_type: ironrdp_pdu::rdp::autodetect::BW_RESULTS_CONTINUOUS,
+        time_delta_ms: 10,
+        byte_count: 100_000,
+    };
+    assert_eq!(
+        mgr.handle_response(&results, 20),
+        AutoDetectOutcome::Bandwidth(Some(80_000))
+    );
+
+    assert!(mgr.build_netchar_result(1_000).is_some(), "the first one is due");
+
+    // Feed a fresh sample so only the interval is under test here.
+    let req = mgr.send_rtt_request(1_000);
+    let _ = mgr.handle_response(
+        &AutoDetectResponse::RttResponse {
+            sequence_number: req.sequence_number(),
+        },
+        1_020,
+    );
+
+    assert!(
+        mgr.build_netchar_result(1_000 + NETCHAR_RESULT_INTERVAL_MS - 1)
+            .is_none(),
+        "a probe inside the interval does not emit another"
+    );
+    assert!(
+        mgr.build_netchar_result(1_000 + NETCHAR_RESULT_INTERVAL_MS).is_some(),
+        "the interval having elapsed, the next one is due"
+    );
+}
+
+/// A client that stops answering must stop producing results. Samples never
+/// age out of the window, so without this the last values would be
+/// advertised forever.
+#[test]
+fn netchar_result_stops_when_the_client_stops_answering() {
+    let mut mgr = AutoDetectManager::new();
+
+    let req = mgr.send_rtt_request(0);
+    let _ = mgr.handle_response(
+        &AutoDetectResponse::RttResponse {
+            sequence_number: req.sequence_number(),
+        },
+        20,
+    );
+    let bw_seq = drive_bandwidth_start_and_stop(&mut mgr);
+    let results = AutoDetectResponse::BandwidthMeasureResults {
+        sequence_number: bw_seq,
+        response_type: ironrdp_pdu::rdp::autodetect::BW_RESULTS_CONTINUOUS,
+        time_delta_ms: 10,
+        byte_count: 100_000,
+    };
+    assert_eq!(
+        mgr.handle_response(&results, 20),
+        AutoDetectOutcome::Bandwidth(Some(80_000))
+    );
+
+    let mut now = 1_000;
+    assert!(mgr.build_netchar_result(now).is_some(), "the first one is due");
+
+    // The client has gone quiet. The interval keeps elapsing and the window
+    // still holds its samples, but there is nothing new to report.
+    for _ in 0..5 {
+        now += NETCHAR_RESULT_INTERVAL_MS;
+        assert!(
+            mgr.build_netchar_result(now).is_none(),
+            "no response has arrived since the last result"
+        );
+    }
+    assert!(mgr.snapshot().is_some(), "the samples are still there for the embedder");
+
+    // One reply, and reporting resumes.
+    let req = mgr.send_rtt_request(now);
+    let _ = mgr.handle_response(
+        &AutoDetectResponse::RttResponse {
+            sequence_number: req.sequence_number(),
+        },
+        now + 20,
+    );
+    now += NETCHAR_RESULT_INTERVAL_MS;
+    assert!(
+        mgr.build_netchar_result(now).is_some(),
+        "a fresh sample resumes reporting"
+    );
+}
+
+/// [MS-RDPBCGR] 2.2.14.1.5 defines baseRTT as the lowest detected RTT, with no
+/// window scoping, so it must not rise when a low sample ages out of the
+/// window. This is the reviewer's sequence: one 5 ms sample, then eight of
+/// 100 ms, which evicts it.
+#[test]
+fn base_rtt_is_the_session_low_not_the_window_low() {
+    let mut mgr = AutoDetectManager::new();
+
+    let sample = |mgr: &mut AutoDetectManager, rtt: u64| {
+        let req = mgr.send_rtt_request(0);
+        let _ = mgr.handle_response(
+            &AutoDetectResponse::RttResponse {
+                sequence_number: req.sequence_number(),
+            },
+            rtt,
+        );
+    };
+
+    sample(&mut mgr, 5);
+    for _ in 0..RTT_WINDOW {
+        sample(&mut mgr, 100);
+    }
+
+    assert_eq!(
+        mgr.snapshot().expect("samples recorded").min_ms,
+        100,
+        "the 5 ms sample has aged out of the window"
+    );
+
+    let bw_seq = drive_bandwidth_start_and_stop(&mut mgr);
+    let results = AutoDetectResponse::BandwidthMeasureResults {
+        sequence_number: bw_seq,
+        response_type: ironrdp_pdu::rdp::autodetect::BW_RESULTS_CONTINUOUS,
+        time_delta_ms: 10,
+        byte_count: 100_000,
+    };
+    assert_eq!(
+        mgr.handle_response(&results, 20),
+        AutoDetectOutcome::Bandwidth(Some(80_000))
+    );
+
+    match mgr.build_netchar_result(1_000).expect("RTT and bandwidth are known") {
+        AutoDetectRequest::NetworkCharacteristicsResult { base_rtt_ms, .. } => {
+            assert_eq!(base_rtt_ms, Some(5), "baseRTT stays at the lowest ever detected");
+        }
+        other => panic!("expected NetworkCharacteristicsResult, got {other:?}"),
+    }
+}
+
+/// The same session-lifetime-low property `base_rtt_is_the_session_low_not_the_window_low`
+/// pins on the wire result, but on the public getter directly rather than through
+/// `build_netchar_result`.
+#[test]
+fn baseline_rtt_ms_reflects_the_session_low_not_the_window_low() {
+    let mut mgr = AutoDetectManager::new();
+    assert!(mgr.baseline_rtt_ms().is_none(), "nothing measured yet");
+
+    let sample = |mgr: &mut AutoDetectManager, rtt: u64| {
+        let req = mgr.send_rtt_request(0);
+        let _ = mgr.handle_response(
+            &AutoDetectResponse::RttResponse {
+                sequence_number: req.sequence_number(),
+            },
+            rtt,
+        );
+    };
+
+    sample(&mut mgr, 5);
+    assert_eq!(mgr.baseline_rtt_ms(), Some(5));
+
+    for _ in 0..RTT_WINDOW {
+        sample(&mut mgr, 100);
+    }
+
+    assert_eq!(
+        mgr.snapshot().expect("samples recorded").min_ms,
+        100,
+        "the 5 ms sample has aged out of the window"
+    );
+    assert_eq!(
+        mgr.baseline_rtt_ms(),
+        Some(5),
+        "the session-lifetime low does not age out with it"
+    );
+}
+
+/// Pins which measured quantity lands in which wire field.
+///
+/// The session minimum, the window minimum and the window average are all
+/// different here, so no swap between them leaves both assertions holding.
+#[test]
+fn netchar_result_maps_each_measurement_to_its_own_field() {
+    let mut mgr = AutoDetectManager::new();
+
+    let sample = |mgr: &mut AutoDetectManager, rtt: u64| {
+        let req = mgr.send_rtt_request(0);
+        let _ = mgr.handle_response(
+            &AutoDetectResponse::RttResponse {
+                sequence_number: req.sequence_number(),
+            },
+            rtt,
+        );
+    };
+
+    sample(&mut mgr, 5);
+    for rtt in [10, 20, 30, 40, 50, 60, 70, 80] {
+        sample(&mut mgr, rtt);
+    }
+
+    let snap = mgr.snapshot().expect("samples recorded");
+    assert_eq!(snap.min_ms, 10, "the 5 ms sample has left the window");
+    assert_eq!(snap.avg_ms, 45, "average of 10 through 80");
+
+    let bw_seq = drive_bandwidth_start_and_stop(&mut mgr);
+    let results = AutoDetectResponse::BandwidthMeasureResults {
+        sequence_number: bw_seq,
+        response_type: ironrdp_pdu::rdp::autodetect::BW_RESULTS_CONTINUOUS,
+        time_delta_ms: 10,
+        byte_count: 100_000,
+    };
+    assert_eq!(
+        mgr.handle_response(&results, 20),
+        AutoDetectOutcome::Bandwidth(Some(80_000))
+    );
+
+    match mgr.build_netchar_result(1_000).expect("RTT and bandwidth are known") {
+        AutoDetectRequest::NetworkCharacteristicsResult {
+            base_rtt_ms,
+            bandwidth_kbps,
+            average_rtt_ms,
+            ..
+        } => {
+            assert_eq!(base_rtt_ms, Some(5), "baseRTT is the session low, not the window low");
+            assert_eq!(average_rtt_ms, 45, "averageRTT is the window average");
+            assert_eq!(bandwidth_kbps, Some(80_000), "byte_count * 8 / time_delta_ms");
+        }
+        other => panic!("expected NetworkCharacteristicsResult, got {other:?}"),
+    }
 }

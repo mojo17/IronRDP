@@ -12,6 +12,18 @@ use crate::utils;
 use crate::utils::CharacterSet;
 
 const RECONNECT_COOKIE_LEN: usize = 28;
+const RECONNECT_COOKIE_VERSION: u32 = 1;
+const RECONNECT_SECURITY_VERIFIER_LEN: usize = 16;
+/// `cbLen` of both auto-reconnect packets, which [MS-RDPBCGR] 2.2.4.2 and 2.2.4.3
+/// fix at 0x0000001C. Matches [`RECONNECT_COOKIE_LEN`] as a `u32`.
+const RECONNECT_COOKIE_CB_LEN: u32 = 0x0000_001C;
+/// Stand-in client random for the security verifier derivation.
+///
+/// Enhanced RDP Security generates no client random ([MS-RDPBCGR] 5.3.2), and
+/// [MS-RDPBCGR] 5.5 specifies that in that case the client random is taken to be
+/// 32 zero bytes for this derivation. IronRDP implements no Standard RDP Security
+/// path (there is no Security Exchange PDU), so this is the only case that arises.
+const ENHANCED_SECURITY_CLIENT_RANDOM: [u8; 32] = [0; 32];
 const TIMEZONE_INFO_NAME_LEN: usize = 64;
 const COMPRESSION_TYPE_MASK: u32 = 0x0000_1E00;
 
@@ -38,6 +50,13 @@ const BIAS_SIZE: usize = 4;
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct ClientInfo {
     pub credentials: Credentials,
+    /// Opaque password cookie sent verbatim in the `Password` field instead of `credentials.password`.
+    ///
+    /// A Server Redirection PDU can carry such a cookie for the target server ([MS-RDPBCGR] 2.2.13.1).
+    /// Decoding fills it when the `Password` field is not valid text.
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    pub password_cookie: Option<PasswordCookie>,
     pub code_page: u32,
     pub flags: ClientInfoFlags,
     pub compression_type: CompressionType,
@@ -48,6 +67,14 @@ pub struct ClientInfo {
 
 impl ClientInfo {
     const NAME: &'static str = "ClientInfo";
+
+    /// Length of the `Password` field, excluding its null terminator.
+    fn password_len(&self, character_set: CharacterSet) -> usize {
+        match &self.password_cookie {
+            Some(cookie) => cookie.0.len(),
+            None => string_len(self.credentials.password.as_str(), character_set),
+        }
+    }
 
     pub const FIXED_PART_SIZE: usize = CODE_PAGE_SIZE
         + FLAGS_SIZE
@@ -76,28 +103,27 @@ impl Encode for ClientInfo {
         let domain = self.credentials.domain.clone().unwrap_or_default();
         dst.write_u16(cast_length!(
             "domain length",
-            string_len(domain.as_str(), character_set)
-        )?);
+            string_len(domain.as_str(), character_set), in: dst)?);
         dst.write_u16(cast_length!(
             "username length",
-            string_len(self.credentials.username.as_str(), character_set)
-        )?);
-        dst.write_u16(cast_length!(
-            "password length",
-            string_len(self.credentials.password.as_str(), character_set)
-        )?);
+            string_len(self.credentials.username.as_str(), character_set), in: dst)?);
+        dst.write_u16(cast_length!("password length", self.password_len(character_set), in: dst)?);
         dst.write_u16(cast_length!(
             "alternate shell length",
-            string_len(self.alternate_shell.as_str(), character_set)
-        )?);
+            string_len(self.alternate_shell.as_str(), character_set), in: dst)?);
         dst.write_u16(cast_length!(
             "work dir length",
-            string_len(self.work_dir.as_str(), character_set)
-        )?);
+            string_len(self.work_dir.as_str(), character_set), in: dst)?);
 
         utils::write_string_to_cursor(dst, domain.as_str(), character_set, true)?;
         utils::write_string_to_cursor(dst, self.credentials.username.as_str(), character_set, true)?;
-        utils::write_string_to_cursor(dst, self.credentials.password.as_str(), character_set, true)?;
+        match &self.password_cookie {
+            Some(cookie) => {
+                dst.write_slice(&cookie.0);
+                write_padding!(dst, usize::from(character_set.as_u16()));
+            }
+            None => utils::write_string_to_cursor(dst, self.credentials.password.as_str(), character_set, true)?,
+        }
         utils::write_string_to_cursor(dst, self.alternate_shell.as_str(), character_set, true)?;
         utils::write_string_to_cursor(dst, self.work_dir.as_str(), character_set, true)?;
 
@@ -127,7 +153,7 @@ impl Encode for ClientInfo {
             + WORK_DIR_LENGTH_SIZE
             + string_len(domain.as_str(), character_set)
                 + string_len(self.credentials.username.as_str(), character_set)
-                + string_len(self.credentials.password.as_str(), character_set)
+                + self.password_len(character_set)
                 + string_len(self.alternate_shell.as_str(), character_set)
                 + string_len(self.work_dir.as_str(), character_set)
             + usize::from(character_set.as_u16()) * 5 // null terminator
@@ -142,10 +168,15 @@ impl<'de> Decode<'de> for ClientInfo {
         let code_page = src.read_u32();
         let flags_with_compression_type = src.read_u32();
 
-        let flags = ClientInfoFlags::from_bits(flags_with_compression_type & !COMPRESSION_TYPE_MASK)
-            .ok_or_else(|| invalid_field_err!("flags", "invalid ClientInfoFlags"))?;
+        // [MS-RDPBCGR] 3.3.5.3.11 asks the server to validate lengths and to
+        // test the UNICODE flag, never to validate this bit set, and the
+        // INFO_* list has grown several times; refusing unknown bits would
+        // reject newer clients at the login step. Retain them instead
+        // (crate-wide policy since #1144) so re-encoding preserves the wire
+        // value.
+        let flags = ClientInfoFlags::from_bits_retain(flags_with_compression_type & !COMPRESSION_TYPE_MASK);
         let compression_type = CompressionType::from_u32((flags_with_compression_type & COMPRESSION_TYPE_MASK) >> 9)
-            .ok_or_else(|| invalid_field_err!("flags", "invalid CompressionType"))?;
+            .ok_or_else(|| invalid_field_err!("flags", "invalid CompressionType", in: src))?;
 
         let character_set = if flags.contains(ClientInfoFlags::UNICODE) {
             CharacterSet::Unicode
@@ -164,7 +195,14 @@ impl<'de> Decode<'de> for ClientInfo {
 
         let domain = utils::decode_string(src.read_slice(domain_size), character_set, true)?;
         let username = utils::decode_string(src.read_slice(user_name_size), character_set, true)?;
-        let password = utils::decode_string(src.read_slice(password_size), character_set, true)?;
+        let password_field = src.read_slice(password_size);
+        let raw_password = &password_field[..password_size - nt];
+        // A password cookie is opaque binary data. The field holds a password only when its text encodes back to the
+        // same bytes: a cookie can contain null code units, invalid text, or end with its own null terminator.
+        let (password, password_cookie) = match utils::decode_string(password_field, character_set, true) {
+            Ok(password) if is_encoded_text(raw_password, &password, character_set) => (password, None),
+            _ => (String::new(), Some(PasswordCookie(raw_password.to_vec()))),
+        };
 
         let domain = if domain.is_empty() { None } else { Some(domain) };
         let credentials = Credentials {
@@ -180,6 +218,7 @@ impl<'de> Decode<'de> for ClientInfo {
 
         Ok(Self {
             credentials,
+            password_cookie,
             code_page,
             flags,
             compression_type,
@@ -187,6 +226,18 @@ impl<'de> Decode<'de> for ClientInfo {
             work_dir,
             extra_info,
         })
+    }
+}
+
+/// Opaque password cookie, such as the one a Server Redirection PDU provides for the target server.
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct PasswordCookie(pub Vec<u8>);
+
+impl fmt::Debug for PasswordCookie {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // NOTE: do not show the secret.
+        f.debug_struct("PasswordCookie").field("len", &self.0.len()).finish()
     }
 }
 
@@ -249,8 +300,9 @@ impl ExtendedClientInfo {
     fn encode(&self, dst: &mut WriteCursor<'_>, character_set: CharacterSet) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size(character_set));
 
-        let address_string_len: u16 = cast_length!("address length", string_len(self.address.as_str(), character_set))?;
-        let dir_string_len: u16 = cast_length!("dir length", string_len(self.dir.as_str(), character_set))?;
+        let address_string_len: u16 =
+            cast_length!("address length", string_len(self.address.as_str(), character_set), in: dst)?;
+        let dir_string_len: u16 = cast_length!("dir length", string_len(self.dir.as_str(), character_set), in: dst)?;
 
         dst.write_u16(self.address_family.as_u16());
         // // + size of null terminator, which will write in the write_string function
@@ -275,14 +327,198 @@ impl ExtendedClientInfo {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// [2.2.4.3] Client Auto-Reconnect Packet (`ARC_CS_PRIVATE_PACKET`)
+///
+/// The client's response to the cookie the server issued in a Save Session Info
+/// PDU. Sent in the extended information of the Client Info PDU ([2.2.1.11.1.1.1])
+/// so the server can confirm the reconnecting client is the one that was last
+/// connected to the session, without asking the user for credentials again.
+///
+/// Unlike [`ServerAutoReconnect`], this structure is not wrapped in a logon-info
+/// field header, so it encodes to exactly 28 bytes.
+///
+/// [2.2.4.3]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/2985e8e3-db10-4a92-9fd5-d5e742d2d0f2
+/// [2.2.1.11.1.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/05ada9e4-a468-494b-8694-eb806a0ecc89
+/// [`ServerAutoReconnect`]: crate::rdp::session_info::ServerAutoReconnect
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct ClientAutoReconnect {
+    /// Session identifier for reconnection, echoed from the server's cookie.
+    pub logon_id: u32,
+    /// Verifier derived from the server's auto-reconnect random.
+    pub security_verifier: [u8; RECONNECT_SECURITY_VERIFIER_LEN],
+}
+
+impl fmt::Debug for ClientAutoReconnect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // NOTE: do not show secret (auto-reconnect security verifier)
+        //
+        // Under Enhanced RDP Security there is no client random, so [MS-RDPBCGR]
+        // 5.5 computes this verifier over 32 zero bytes. It is therefore constant
+        // for a given cookie, and replaying it is sufficient to resume the
+        // session: possession of the verifier alone is the credential.
+        f.debug_struct("ClientAutoReconnect")
+            .field("logon_id", &self.logon_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ClientAutoReconnect {
+    const NAME: &'static str = "ClientAutoReconnect";
+
+    const FIXED_PART_SIZE: usize = RECONNECT_COOKIE_LEN;
+
+    /// Derive the response to a server-issued auto-reconnect cookie.
+    ///
+    /// Per [MS-RDPBCGR] 5.5 the verifier is
+    /// `SecurityVerifier = HMAC(AutoReconnectRandom, ClientRandom)`, an HMAC
+    /// ([RFC 2104]) keyed by the server's 16 random bytes and using MD5 as the
+    /// hash, applied to the client random. Under Enhanced RDP Security there is
+    /// no client random, so 5.5 substitutes 32 zero bytes; the spec notes the
+    /// consequence, that the verifier is then constant for a given cookie, so it
+    /// proves possession of the cookie and nothing more. Session security comes
+    /// from the outer TLS/CredSSP handshake.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice. HMAC accepts a key of any length, so the keying step
+    /// cannot reject the 16 bytes the server sent.
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/e729948a-3f4e-4568-9aef-d355e30b5389
+    /// [RFC 2104]: https://www.rfc-editor.org/rfc/rfc2104
+    pub fn from_server_cookie(cookie: &crate::rdp::session_info::ServerAutoReconnect) -> Self {
+        use hmac::Mac as _;
+
+        Self {
+            logon_id: cookie.logon_id,
+            security_verifier: Self::keyed_hmac(cookie).finalize().into_bytes().into(),
+        }
+    }
+
+    /// Whether this packet answers `cookie`, and so may resume its session.
+    ///
+    /// The server side of [`Self::from_server_cookie`]: it recomputes the
+    /// verifier from the random it issued and checks the client returned the
+    /// same one, for the same session.
+    ///
+    /// The verifier is compared in constant time. It is the whole credential
+    /// (see [`Self::from_server_cookie`] on why possession of it is sufficient),
+    /// so a comparison that returned early on the first differing byte would let
+    /// a peer recover it one byte at a time from the timing. The session
+    /// identifier is not secret and is compared normally.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice, for the reason given on [`Self::from_server_cookie`].
+    pub fn verify(&self, cookie: &crate::rdp::session_info::ServerAutoReconnect) -> bool {
+        use hmac::Mac as _;
+
+        self.logon_id == cookie.logon_id && Self::keyed_hmac(cookie).verify_slice(&self.security_verifier).is_ok()
+    }
+
+    fn keyed_hmac(cookie: &crate::rdp::session_info::ServerAutoReconnect) -> hmac::Hmac<md5::Md5> {
+        use hmac::Mac as _;
+
+        let mut mac = hmac::Hmac::<md5::Md5>::new_from_slice(&cookie.random_bits)
+            .expect("HMAC accepts a key of any length, so a 16-byte key cannot fail");
+        mac.update(&ENHANCED_SECURITY_CLIENT_RANDOM);
+        mac
+    }
+
+    /// The encoded packet, sized for the `autoReconnectCookie` field of the
+    /// Client Info PDU's extended information.
+    ///
+    /// Written directly rather than through [`Encode`] so the conversion has no
+    /// failure path at all: the structure is fixed-size, so a caller filling a
+    /// fixed-size field should not have to handle an error that cannot occur. The
+    /// two are pinned to agree by test.
+    pub fn to_bytes(&self) -> [u8; RECONNECT_COOKIE_LEN] {
+        let mut buf = [0; RECONNECT_COOKIE_LEN];
+        buf[0..4].copy_from_slice(&RECONNECT_COOKIE_CB_LEN.to_le_bytes());
+        buf[4..8].copy_from_slice(&RECONNECT_COOKIE_VERSION.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.logon_id.to_le_bytes());
+        buf[12..].copy_from_slice(&self.security_verifier);
+        buf
+    }
+}
+
+impl Encode for ClientAutoReconnect {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_fixed_part_size!(in: dst);
+
+        dst.write_u32(RECONNECT_COOKIE_CB_LEN);
+        dst.write_u32(RECONNECT_COOKIE_VERSION);
+        dst.write_u32(self.logon_id);
+        dst.write_slice(self.security_verifier.as_ref());
+
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn size(&self) -> usize {
+        Self::FIXED_PART_SIZE
+    }
+}
+
+impl<'de> Decode<'de> for ClientAutoReconnect {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        ensure_fixed_part_size!(in: src);
+
+        let cb_len_pos = src.pos();
+        let packet_length = src.read_u32();
+        if packet_length != RECONNECT_COOKIE_CB_LEN {
+            return Err(invalid_field_err!(
+                "cbLen",
+                "invalid auto-reconnect packet size",
+                at: cb_len_pos
+            ));
+        }
+
+        let version_pos = src.pos();
+        let version = src.read_u32();
+        if version != RECONNECT_COOKIE_VERSION {
+            return Err(invalid_field_err!("Version", "invalid auto-reconnect version", at: version_pos));
+        }
+
+        let logon_id = src.read_u32();
+        let security_verifier = src.read_array();
+
+        Ok(Self {
+            logon_id,
+            security_verifier,
+        })
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct ExtendedClientOptionalInfo {
     timezone: Option<TimezoneInfo>,
     session_id: Option<u32>,
     performance_flags: Option<PerformanceFlags>,
     reconnect_cookie: Option<[u8; RECONNECT_COOKIE_LEN]>,
+    auto_reconnect: Option<ClientAutoReconnect>,
     // other fields are read by RdpVersion::Ten+
+}
+
+impl fmt::Debug for ExtendedClientOptionalInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // NOTE: do not show secret (raw auto-reconnect cookie)
+        //
+        // `reconnect_cookie` is the wire form of `auto_reconnect` and carries the
+        // same security verifier in the clear, so redacting only the parsed field
+        // would leave the bytes readable here. `auto_reconnect` is safe to show
+        // because its own `Debug` elides the verifier.
+        f.debug_struct("ExtendedClientOptionalInfo")
+            .field("timezone", &self.timezone)
+            .field("session_id", &self.session_id)
+            .field("performance_flags", &self.performance_flags)
+            .field("auto_reconnect", &self.auto_reconnect)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ExtendedClientOptionalInfo {
@@ -308,6 +544,14 @@ impl ExtendedClientOptionalInfo {
 
     pub fn reconnect_cookie(&self) -> Option<&[u8; RECONNECT_COOKIE_LEN]> {
         self.reconnect_cookie.as_ref()
+    }
+
+    /// The well-formed Client Auto-Reconnect Packet, if supplied by the client.
+    ///
+    /// This validates only the packet's internal length and version. The server
+    /// must validate its security verifier before accepting a reconnect.
+    pub fn auto_reconnect(&self) -> Option<&ClientAutoReconnect> {
+        self.auto_reconnect.as_ref()
     }
 }
 
@@ -375,7 +619,7 @@ impl<'de> Decode<'de> for ExtendedClientOptionalInfo {
         }
         optional_data.performance_flags = Some(
             PerformanceFlags::from_bits(src.read_u32())
-                .ok_or_else(|| invalid_field_err!("performanceFlags", "invalid performance flags"))?,
+                .ok_or_else(|| invalid_field_err!("performanceFlags", "invalid performance flags", in: src))?,
         );
 
         if src.len() < 2 {
@@ -385,13 +629,15 @@ impl<'de> Decode<'de> for ExtendedClientOptionalInfo {
         if reconnect_cookie_size != u16::try_from(RECONNECT_COOKIE_LEN).expect("RECONNECT_COOKIE_LEN fit into u16")
             && reconnect_cookie_size != 0
         {
-            return Err(invalid_field_err!("cbAutoReconnectCookie", "invalid cookie size"));
+            return Err(invalid_field_err!("cbAutoReconnectCookie", "invalid cookie size", in: src));
         }
         if reconnect_cookie_size != 0 {
             if src.len() < RECONNECT_COOKIE_LEN {
-                return Err(invalid_field_err!("cbAutoReconnectCookie", "missing cookie data"));
+                return Err(invalid_field_err!("cbAutoReconnectCookie", "missing cookie data", in: src));
             }
-            optional_data.reconnect_cookie = Some(src.read_array());
+            let reconnect_cookie = src.read_array();
+            optional_data.auto_reconnect = ClientAutoReconnect::decode(&mut ReadCursor::new(&reconnect_cookie)).ok();
+            optional_data.reconnect_cookie = Some(reconnect_cookie);
         }
 
         if src.len() < 2 * 2 {
@@ -769,6 +1015,17 @@ impl CompressionType {
     }
 }
 
+/// Whether `encoded` is exactly `value` in `character_set`, without a null terminator.
+fn is_encoded_text(encoded: &[u8], value: &str, character_set: CharacterSet) -> bool {
+    match character_set {
+        CharacterSet::Ansi => encoded == value.as_bytes(),
+        CharacterSet::Unicode => encoded
+            .iter()
+            .copied()
+            .eq(value.encode_utf16().flat_map(u16::to_le_bytes)),
+    }
+}
+
 fn string_len(value: &str, character_set: CharacterSet) -> usize {
     match character_set {
         CharacterSet::Ansi => value.len(),
@@ -780,7 +1037,11 @@ fn string_len(value: &str, character_set: CharacterSet) -> usize {
 pub mod builder {
     use core::marker::PhantomData;
 
-    use super::{ExtendedClientOptionalInfo, PerformanceFlags, RECONNECT_COOKIE_LEN, TimezoneInfo};
+    use ironrdp_core::{Decode as _, ReadCursor};
+
+    use super::{
+        ClientAutoReconnect, ExtendedClientOptionalInfo, PerformanceFlags, RECONNECT_COOKIE_LEN, TimezoneInfo,
+    };
 
     pub struct ExtendedClientOptionalInfoBuilderStateSetTimeZone;
     pub struct ExtendedClientOptionalInfoBuilderStateSetSessionId;
@@ -861,11 +1122,110 @@ pub mod builder {
             mut self,
             reconnect_cookie: [u8; RECONNECT_COOKIE_LEN],
         ) -> ExtendedClientOptionalInfoBuilder<ExtendedClientOptionalInfoBuilderStateFinal> {
+            self.inner.auto_reconnect = ClientAutoReconnect::decode(&mut ReadCursor::new(&reconnect_cookie)).ok();
             self.inner.reconnect_cookie = Some(reconnect_cookie);
             ExtendedClientOptionalInfoBuilder {
                 inner: self.inner,
                 _phantom_data: Default::default(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ironrdp_core::{Decode as _, ReadCursor, decode, encode_vec};
+
+    use super::{ClientAutoReconnect, ExtendedClientOptionalInfo, PerformanceFlags, TimezoneInfo};
+
+    fn reconnect_cookie() -> [u8; 28] {
+        let mut cookie = [0; 28];
+        cookie[0..4].copy_from_slice(&28u32.to_le_bytes());
+        cookie[4..8].copy_from_slice(&1u32.to_le_bytes());
+        cookie[8..12].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        cookie[12..].copy_from_slice(&[0xA5; 16]);
+        cookie
+    }
+
+    #[test]
+    fn client_auto_reconnect_decodes() {
+        let cookie = reconnect_cookie();
+        let decoded = ClientAutoReconnect::decode(&mut ReadCursor::new(&cookie)).unwrap();
+
+        assert_eq!(decoded.logon_id, 0x1234_5678);
+        assert_eq!(decoded.security_verifier, [0xA5; 16]);
+    }
+
+    #[test]
+    fn client_auto_reconnect_rejects_invalid_length_and_version() {
+        let mut invalid_length = reconnect_cookie();
+        invalid_length[0..4].copy_from_slice(&27u32.to_le_bytes());
+        assert!(ClientAutoReconnect::decode(&mut ReadCursor::new(&invalid_length)).is_err());
+
+        let mut invalid_version = reconnect_cookie();
+        invalid_version[4..8].copy_from_slice(&2u32.to_le_bytes());
+        assert!(ClientAutoReconnect::decode(&mut ReadCursor::new(&invalid_version)).is_err());
+    }
+
+    /// The security verifier must not reach logs, in either of its two forms.
+    ///
+    /// `ClientInfoPdu` is logged whole by the connector when it sends it, which
+    /// is why `Credentials` above hand-writes `Debug`. The verifier belongs in
+    /// the same category: 5.5 computes it over a constant client random under
+    /// Enhanced RDP Security, so replaying it resumes the session.
+    #[test]
+    fn security_verifier_is_redacted_from_debug_output() {
+        let cookie = reconnect_cookie();
+        let parsed = ClientAutoReconnect::decode(&mut ReadCursor::new(&cookie)).unwrap();
+        let optional_info = ExtendedClientOptionalInfo {
+            timezone: Some(TimezoneInfo::default()),
+            session_id: Some(0),
+            performance_flags: Some(PerformanceFlags::default()),
+            reconnect_cookie: Some(cookie),
+            auto_reconnect: Some(parsed.clone()),
+        };
+
+        // 0xA5 renders as `165` in the derived byte-slice output.
+        for (label, rendered) in [
+            ("ClientAutoReconnect", format!("{parsed:?}")),
+            ("ExtendedClientOptionalInfo", format!("{optional_info:?}")),
+        ] {
+            assert!(!rendered.contains("165"), "{label} leaked the verifier: {rendered}");
+        }
+
+        // The session identifier is not secret and stays visible for diagnosis.
+        assert!(format!("{parsed:?}").contains(&0x1234_5678u32.to_string()));
+    }
+
+    #[test]
+    fn malformed_auto_reconnect_packet_is_preserved_but_not_offered() {
+        let mut reconnect_cookie = reconnect_cookie();
+        reconnect_cookie[4..8].copy_from_slice(&2u32.to_le_bytes());
+        let optional_info = ExtendedClientOptionalInfo {
+            timezone: Some(TimezoneInfo::default()),
+            session_id: Some(0),
+            performance_flags: Some(PerformanceFlags::default()),
+            reconnect_cookie: Some(reconnect_cookie),
+            auto_reconnect: None,
+        };
+
+        let decoded: ExtendedClientOptionalInfo = decode(&encode_vec(&optional_info).unwrap()).unwrap();
+        assert_eq!(decoded.reconnect_cookie(), Some(&reconnect_cookie));
+        assert!(decoded.auto_reconnect().is_none());
+    }
+
+    #[test]
+    fn builder_parses_valid_auto_reconnect_packet() {
+        let optional_info = ExtendedClientOptionalInfo::builder()
+            .timezone(TimezoneInfo::default())
+            .session_id(0)
+            .performance_flags(PerformanceFlags::default())
+            .reconnect_cookie(reconnect_cookie())
+            .build();
+
+        assert_eq!(
+            optional_info.auto_reconnect().map(|packet| packet.logon_id),
+            Some(0x1234_5678)
+        );
     }
 }

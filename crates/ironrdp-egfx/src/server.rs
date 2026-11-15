@@ -55,12 +55,15 @@
 //! let server = GraphicsPipelineServer::new(Box::new(MyHandler));
 //! ```
 
-use std::collections::{HashMap, VecDeque};
+use core::num::NonZeroU32;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use ironrdp_core::{Encode, EncodeResult, WriteCursor, decode, impl_as_any};
 use ironrdp_dvc::{DvcEncode, DvcMessage, DvcProcessor, DvcServerProcessor};
-use ironrdp_graphics::zgfx::{CompressionMode, Compressor, compress_and_wrap_egfx, wrap_uncompressed};
+use ironrdp_graphics::zgfx::{
+    CompressionMode, Compressor, compress_and_wrap_egfx, wrap_uncompressed, wrap_uncompressed_recorded,
+};
 use ironrdp_pdu::gcc::Monitor;
 use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_pdu::{PduResult, decode_err};
@@ -85,6 +88,22 @@ const DEFAULT_MAX_FRAMES_IN_FLIGHT: u32 = 3;
 
 /// Special queue depth value indicating client has disabled acknowledgments
 const SUSPEND_FRAME_ACK_QUEUE_DEPTH: u32 = 0xFFFFFFFF;
+
+/// Highest QP in the H.264 range that MS-RDPEGFX [2.2.4.4.2]
+/// (`RDPGFX_AVC420_QUANT_QUALITY`) requires for the `qp` field of an AVC420
+/// region, for 8-bit video.
+///
+/// [2.2.4.4.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/bc54993f-2e3c-4285-b32b-58a4bf4cb02e
+const MAX_AVC_QP: u8 = 51;
+
+/// Highest `qualityVal` of an AVC420 region (MS-RDPEGFX [2.2.4.4.2]).
+///
+/// [2.2.4.4.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/bc54993f-2e3c-4285-b32b-58a4bf4cb02e
+const MAX_AVC_QUALITY: u8 = 100;
+
+/// Bytes a pixel takes in an uncompressed `WireToSurface1` bitmap. Both surface
+/// pixel formats, `XRGB_8888` and `ARGB_8888`, are 32 bits wide.
+const UNCOMPRESSED_BYTES_PER_PIXEL: usize = 4;
 
 /// Pre-encoded ZGFX-wrapped bytes for DVC transmission.
 ///
@@ -209,6 +228,18 @@ impl Surfaces {
     /// Clear all surfaces
     pub fn clear(&mut self) {
         self.surfaces.clear();
+    }
+
+    /// Clear all surfaces AND reset the surface ID allocator to 0.
+    ///
+    /// Used by the server when the client emits a mid-session
+    /// CapsAdvertise (a decoder-recovery sequence): the client has
+    /// already cleared its own surface state and expects new surface
+    /// IDs to start from 0. Distinct from [`clear`] which preserves the
+    /// counter.
+    pub fn reset_for_reinit(&mut self) {
+        self.surfaces.clear();
+        self.next_surface_id = 0;
     }
 
     /// Number of surfaces
@@ -487,12 +518,27 @@ pub struct FrameTracker {
     ack_suspended: bool,
     /// Next frame ID to assign
     next_frame_id: u32,
-    /// Maximum frames in flight before backpressure
-    max_in_flight: u32,
+    /// First frame ID issued in this generation, used to validate suspend ACKs.
+    generation_first_frame_id: u32,
+    /// Frames still outstanding when acknowledgements were suspended.
+    suspension_outstanding: HashSet<u32>,
+    /// First frame ID issued during the current suspension.
+    suspension_first_frame_id: Option<u32>,
+    /// Operator-configured maximum frames in flight (zero means unlimited).
+    configured_max_in_flight: u32,
+    /// Optional non-zero ceiling advertised by the active client.
+    client_max_in_flight: Option<NonZeroU32>,
     /// Total frames sent
     total_sent: u64,
     /// Total frames acknowledged
     total_acked: u64,
+    /// Tracks last-emitted backpressure state for edge-triggered transition
+    /// logging. Without this, callers either log nothing (and the failure is
+    /// invisible) or log every call (and the log floods at 30+/sec). Edge
+    /// triggering gives one line on engage, one line on release.
+    last_backpressure_state: bool,
+    /// Tracks last-emitted ack_suspended state for the same reason.
+    last_ack_suspended_state: bool,
 }
 
 impl Default for FrameTracker {
@@ -509,15 +555,80 @@ impl FrameTracker {
             client_queue_depth: 0,
             ack_suspended: false,
             next_frame_id: 0,
-            max_in_flight: DEFAULT_MAX_FRAMES_IN_FLIGHT,
+            generation_first_frame_id: 0,
+            suspension_outstanding: HashSet::new(),
+            suspension_first_frame_id: None,
+            configured_max_in_flight: DEFAULT_MAX_FRAMES_IN_FLIGHT,
+            client_max_in_flight: None,
             total_sent: 0,
             total_acked: 0,
+            last_backpressure_state: false,
+            last_ack_suspended_state: false,
         }
     }
 
-    /// Set maximum frames in flight
+    /// Emit edge-triggered diagnostic logs when backpressure or ack_suspended
+    /// state changes. Called from begin_frame / acknowledge. Single source of
+    /// truth so callers don't need to remember to log.
+    ///
+    /// MS-RDPEGFX § 2.2.4.3 RDPGFX_FRAME_ACKNOWLEDGE_PDU defines queue_depth=0xFFFFFFFF
+    /// as SUSPEND_FRAME_ACKNOWLEDGEMENT. We surface that distinct state separately
+    /// so operators can tell "we're saturated" from "client said stop ack'ing."
+    fn emit_state_transitions(&mut self) {
+        let in_flight = self.in_flight();
+        let now_backpressure = self.should_backpressure();
+        if now_backpressure != self.last_backpressure_state {
+            if now_backpressure {
+                debug!(
+                    in_flight,
+                    max_in_flight = self.max_in_flight(),
+                    ack_suspended = self.ack_suspended,
+                    client_queue_depth = self.client_queue_depth,
+                    "EGFX backpressure ENGAGED, encoder must wait for FrameAcknowledge"
+                );
+            } else {
+                debug!(
+                    in_flight,
+                    max_in_flight = self.max_in_flight(),
+                    "EGFX backpressure RELEASED, encoder may proceed"
+                );
+            }
+            self.last_backpressure_state = now_backpressure;
+        }
+        if self.ack_suspended != self.last_ack_suspended_state {
+            if self.ack_suspended {
+                debug!(
+                    in_flight,
+                    "EGFX ack_suspended ENGAGED, client requested no FrameAcknowledge (queue_depth=0xFFFFFFFF per MS-RDPEGFX 2.2.4.3)"
+                );
+            } else {
+                debug!(
+                    in_flight,
+                    client_queue_depth = self.client_queue_depth,
+                    "EGFX ack_suspended RELEASED"
+                );
+            }
+            self.last_ack_suspended_state = self.ack_suspended;
+        }
+    }
+
+    /// Set the operator-configured maximum frames in flight.
+    ///
+    /// Zero means unlimited, while a negotiated client ceiling still applies.
     pub fn set_max_in_flight(&mut self, max: u32) {
-        self.max_in_flight = max;
+        self.configured_max_in_flight = max;
+    }
+
+    /// Effective maximum number of frames permitted in flight.
+    ///
+    /// Zero means unlimited only when no client ceiling is present.
+    pub fn max_in_flight(&self) -> u32 {
+        match (self.configured_max_in_flight, self.client_max_in_flight) {
+            (0, None) => 0,
+            (0, Some(client)) => client.get(),
+            (configured, None) => configured,
+            (configured, Some(client)) => configured.min(client.get()),
+        }
     }
 
     /// Allocate a new frame ID and track it
@@ -525,17 +636,25 @@ impl FrameTracker {
         let frame_id = self.next_frame_id;
         self.next_frame_id = self.next_frame_id.wrapping_add(1);
 
-        self.unacknowledged.insert(
-            frame_id,
-            FrameInfo {
+        // A suspended client sends no acknowledgement until it opts back in
+        // ([MS-RDPEGFX] 2.2.2.13), so nothing would take this frame back out.
+        // Backpressure is off while suspended, so the entry has no work to do.
+        if !self.ack_suspended {
+            self.unacknowledged.insert(
                 frame_id,
-                timestamp,
-                sent_at: Instant::now(),
-                size_bytes: 0,
-            },
-        );
+                FrameInfo {
+                    frame_id,
+                    timestamp,
+                    sent_at: Instant::now(),
+                    size_bytes: 0,
+                },
+            );
+        }
 
         self.total_sent += 1;
+        // Edge-trigger after insert so a frame that pushes us to max_in_flight
+        // logs the transition.
+        self.emit_state_transitions();
         frame_id
     }
 
@@ -546,21 +665,24 @@ impl FrameTracker {
         }
     }
 
-    /// Handle frame acknowledgment from client
+    /// Handle a tracked frame acknowledgment from the client.
     pub fn acknowledge(&mut self, frame_id: u32, queue_depth: u32) -> Option<FrameInfo> {
-        if queue_depth == SUSPEND_FRAME_ACK_QUEUE_DEPTH {
-            self.ack_suspended = true;
-            self.client_queue_depth = 0;
+        // Validate the acknowledgement before it can alter flow-control state.
+        // A stale acknowledgement must not suspend the current generation.
+        let info = self.unacknowledged.remove(&frame_id)?;
+        let suspending = queue_depth == SUSPEND_FRAME_ACK_QUEUE_DEPTH;
+        if suspending {
+            self.suspend_acknowledgements();
         } else {
             self.ack_suspended = false;
             self.client_queue_depth = queue_depth;
         }
 
-        let info = self.unacknowledged.remove(&frame_id);
-        if info.is_some() {
-            self.total_acked += 1;
-        }
-        info
+        self.total_acked += 1;
+        // Edge-trigger after the remove/clear so an ack that releases
+        // backpressure logs.
+        self.emit_state_transitions();
+        Some(info)
     }
 
     /// Number of frames in flight
@@ -575,7 +697,8 @@ impl FrameTracker {
 
     /// Check if backpressure should be applied
     pub fn should_backpressure(&self) -> bool {
-        !self.ack_suspended && self.in_flight() >= self.max_in_flight
+        let max_in_flight = self.max_in_flight();
+        !self.ack_suspended && max_in_flight != 0 && self.in_flight() >= max_in_flight
     }
 
     /// Get client queue depth
@@ -598,13 +721,111 @@ impl FrameTracker {
         self.total_acked
     }
 
-    /// Clear all tracking state
-    pub fn clear(&mut self) {
+    fn suspend_acknowledgements(&mut self) {
+        if !self.ack_suspended {
+            self.suspension_outstanding = self.unacknowledged.keys().copied().collect();
+            self.suspension_first_frame_id = Some(self.next_frame_id);
+        }
+        self.ack_suspended = true;
+        self.client_queue_depth = 0;
+        self.unacknowledged.clear();
+    }
+
+    /// A valid suspend request is independent of whether an RTT sample is tracked.
+    fn suspend_from_untracked_ack(&mut self, frame_id: u32) -> bool {
+        let issued = frame_id.wrapping_sub(self.generation_first_frame_id)
+            < self.next_frame_id.wrapping_sub(self.generation_first_frame_id);
+        if !issued {
+            return false;
+        }
+        self.suspend_acknowledgements();
+        self.emit_state_transitions();
+        true
+    }
+
+    /// Resume only for a frame outstanding at suspension or issued during it.
+    /// Already-acknowledged frames cannot change the current flow-control state.
+    fn resume_from_untracked_ack(&mut self, frame_id: u32, queue_depth: u32) -> bool {
+        if !self.ack_suspended || queue_depth == SUSPEND_FRAME_ACK_QUEUE_DEPTH {
+            return false;
+        }
+        let issued_during_suspension = self
+            .suspension_first_frame_id
+            .is_some_and(|first| frame_id.wrapping_sub(first) < self.next_frame_id.wrapping_sub(first));
+        if !self.suspension_outstanding.contains(&frame_id) && !issued_during_suspension {
+            return false;
+        }
+        self.suspension_outstanding.clear();
+        self.suspension_first_frame_id = None;
+        self.ack_suspended = false;
+        self.client_queue_depth = queue_depth;
+        self.emit_state_transitions();
+        true
+    }
+
+    /// Discard pending frames for a graphics reset without ending the DVC generation.
+    /// Previously issued frames can still be named by delayed suspend ACKs.
+    fn clear_pending_frames(&mut self) {
         self.unacknowledged.clear();
         self.client_queue_depth = 0;
         self.ack_suspended = false;
+        self.suspension_outstanding.clear();
+        self.suspension_first_frame_id = None;
+        self.last_backpressure_state = false;
+        self.last_ack_suspended_state = false;
+    }
+
+    /// Clear per-channel tracking while preserving operator config and the connection ceiling.
+    pub fn clear(&mut self) {
+        self.clear_pending_frames();
+        self.generation_first_frame_id = self.next_frame_id;
     }
 }
+
+/// Typed reason why an encoded frame could not be submitted to EGFX.
+///
+/// Backpressure is an expected transient flow-control condition. Callers must
+/// not treat it as an encoder or channel failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FrameSubmissionError {
+    /// EGFX capability negotiation has not completed or the channel is closed.
+    NotReady,
+    /// The negotiated client capability does not include AVC420.
+    Avc420Unsupported,
+    /// The negotiated client capability does not include AVC444.
+    Avc444Unsupported,
+    /// The acknowledgement window is full.
+    Backpressured {
+        frames_in_flight: u32,
+        max_frames_in_flight: u32,
+    },
+    /// The requested surface does not exist.
+    UnknownSurface { surface_id: u16 },
+    /// The requested frame does not satisfy the EGFX framing rules.
+    InvalidFrame,
+}
+
+impl core::fmt::Display for FrameSubmissionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotReady => f.write_str("EGFX channel is not ready"),
+            Self::Avc420Unsupported => f.write_str("AVC420 is not supported by the client"),
+            Self::Avc444Unsupported => f.write_str("AVC444 is not supported by the client"),
+            Self::Backpressured {
+                frames_in_flight,
+                max_frames_in_flight,
+            } => write!(
+                f,
+                "EGFX acknowledgement window is full ({frames_in_flight}/{max_frames_in_flight})"
+            ),
+            Self::UnknownSurface { surface_id } => write!(f, "unknown EGFX surface {surface_id}"),
+            Self::InvalidFrame => f.write_str("EGFX frame does not satisfy the negotiated framing rules"),
+        }
+    }
+}
+
+impl core::error::Error for FrameSubmissionError {}
 
 // ============================================================================
 // Capability Negotiation
@@ -618,6 +839,18 @@ pub struct CodecCapabilities {
     pub avc420: bool,
     /// AVC444 (H.264 4:4:4) is available
     pub avc444: bool,
+    /// The negotiated capability set promises AVC420 in the same frame as other codecs
+    ///
+    /// MS-RDPEGFX [2.2.3.7] (`RDPGFX_CAPSET_VERSION104`) requires that of a
+    /// client that did not set `AVC_DISABLED` at capability version 10.4, and
+    /// [2.2.3.8], [2.2.3.9] and [2.2.3.10] carry it to 10.5, 10.6 and 10.7.
+    /// Earlier versions make no such promise.
+    ///
+    /// [2.2.3.7]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/be5ea8da-44db-478d-b55c-d42d82f11d26
+    /// [2.2.3.8]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/8fc20f1e-e63e-4b13-a546-22fba213ad83
+    /// [2.2.3.9]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/8d489900-e903-4778-bb83-691c5ab719d5
+    /// [2.2.3.10]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/ba94595b-04de-4fbd-8ee4-89d8ff8f5cf1
+    pub avc420_in_mixed_frames: bool,
     /// Small cache mode
     pub small_cache: bool,
     /// Thin client mode
@@ -631,24 +864,28 @@ impl CodecCapabilities {
             CapabilitySet::V8 { flags } => Self {
                 avc420: false,
                 avc444: false,
+                avc420_in_mixed_frames: false,
                 small_cache: flags.contains(CapabilitiesV8Flags::SMALL_CACHE),
                 thin_client: flags.contains(CapabilitiesV8Flags::THIN_CLIENT),
             },
             CapabilitySet::V8_1 { flags } => Self {
                 avc420: flags.contains(CapabilitiesV81Flags::AVC420_ENABLED),
                 avc444: false,
+                avc420_in_mixed_frames: false,
                 small_cache: flags.contains(CapabilitiesV81Flags::SMALL_CACHE),
                 thin_client: flags.contains(CapabilitiesV81Flags::THIN_CLIENT),
             },
             CapabilitySet::V10 { flags } | CapabilitySet::V10_2 { flags } => Self {
                 avc420: !flags.contains(CapabilitiesV10Flags::AVC_DISABLED),
                 avc444: !flags.contains(CapabilitiesV10Flags::AVC_DISABLED),
+                avc420_in_mixed_frames: false,
                 small_cache: flags.contains(CapabilitiesV10Flags::SMALL_CACHE),
                 thin_client: false,
             },
             CapabilitySet::V10_1 => Self {
                 avc420: true,
                 avc444: true,
+                avc420_in_mixed_frames: false,
                 small_cache: false,
                 thin_client: false,
             },
@@ -656,6 +893,7 @@ impl CodecCapabilities {
                 // V10.3 lacks SMALL_CACHE flag
                 avc420: !flags.contains(CapabilitiesV103Flags::AVC_DISABLED),
                 avc444: !flags.contains(CapabilitiesV103Flags::AVC_DISABLED),
+                avc420_in_mixed_frames: false,
                 small_cache: false,
                 thin_client: flags.contains(CapabilitiesV103Flags::AVC_THIN_CLIENT),
             },
@@ -665,12 +903,14 @@ impl CodecCapabilities {
             | CapabilitySet::V10_6Err { flags } => Self {
                 avc420: !flags.contains(CapabilitiesV104Flags::AVC_DISABLED),
                 avc444: !flags.contains(CapabilitiesV104Flags::AVC_DISABLED),
+                avc420_in_mixed_frames: !flags.contains(CapabilitiesV104Flags::AVC_DISABLED),
                 small_cache: flags.contains(CapabilitiesV104Flags::SMALL_CACHE),
                 thin_client: flags.contains(CapabilitiesV104Flags::AVC_THIN_CLIENT),
             },
             CapabilitySet::V10_7 { flags } => Self {
                 avc420: !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
                 avc444: !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
+                avc420_in_mixed_frames: !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
                 small_cache: flags.contains(CapabilitiesV107Flags::SMALL_CACHE),
                 thin_client: flags.contains(CapabilitiesV107Flags::AVC_THIN_CLIENT),
             },
@@ -703,7 +943,9 @@ fn negotiate_capabilities(client_caps: &[CapabilitySet], server_caps: &[Capabili
     for server_cap in server_sorted {
         for client_cap in client_caps {
             if core::mem::discriminant(client_cap) == core::mem::discriminant(server_cap) {
-                return Some(intersect_flags(client_cap, server_cap));
+                return Some(sanitize_capabilities_for_confirm(intersect_flags(
+                    client_cap, server_cap,
+                )));
             }
         }
     }
@@ -711,38 +953,67 @@ fn negotiate_capabilities(client_caps: &[CapabilitySet], server_caps: &[Capabili
     None
 }
 
-/// Intersect flags for matching capability set versions
+/// Intersect positive flags while preserving the client AVC decoder constraint.
 fn intersect_flags(client: &CapabilitySet, server: &CapabilitySet) -> CapabilitySet {
     match (client, server) {
         (CapabilitySet::V8 { flags: cf }, CapabilitySet::V8 { flags: sf }) => CapabilitySet::V8 { flags: *cf & *sf },
         (CapabilitySet::V8_1 { flags: cf }, CapabilitySet::V8_1 { flags: sf }) => {
             CapabilitySet::V8_1 { flags: *cf & *sf }
         }
-        (CapabilitySet::V10 { flags: cf }, CapabilitySet::V10 { flags: sf }) => CapabilitySet::V10 { flags: *cf & *sf },
-        (CapabilitySet::V10_2 { flags: cf }, CapabilitySet::V10_2 { flags: sf }) => {
-            CapabilitySet::V10_2 { flags: *cf & *sf }
-        }
-        (CapabilitySet::V10_3 { flags: cf }, CapabilitySet::V10_3 { flags: sf }) => {
-            CapabilitySet::V10_3 { flags: *cf & *sf }
-        }
-        (CapabilitySet::V10_4 { flags: cf }, CapabilitySet::V10_4 { flags: sf }) => {
-            CapabilitySet::V10_4 { flags: *cf & *sf }
-        }
-        (CapabilitySet::V10_5 { flags: cf }, CapabilitySet::V10_5 { flags: sf }) => {
-            CapabilitySet::V10_5 { flags: *cf & *sf }
-        }
-        (CapabilitySet::V10_6 { flags: cf }, CapabilitySet::V10_6 { flags: sf }) => {
-            CapabilitySet::V10_6 { flags: *cf & *sf }
-        }
-        (CapabilitySet::V10_6Err { flags: cf }, CapabilitySet::V10_6Err { flags: sf }) => {
-            CapabilitySet::V10_6Err { flags: *cf & *sf }
-        }
-        (CapabilitySet::V10_7 { flags: cf }, CapabilitySet::V10_7 { flags: sf }) => {
-            CapabilitySet::V10_7 { flags: *cf & *sf }
-        }
+        (CapabilitySet::V10 { flags: cf }, CapabilitySet::V10 { flags: sf }) => CapabilitySet::V10 {
+            flags: (*cf & *sf) | (*cf & CapabilitiesV10Flags::AVC_DISABLED),
+        },
+        (CapabilitySet::V10_2 { flags: cf }, CapabilitySet::V10_2 { flags: sf }) => CapabilitySet::V10_2 {
+            flags: (*cf & *sf) | (*cf & CapabilitiesV10Flags::AVC_DISABLED),
+        },
+        (CapabilitySet::V10_3 { flags: cf }, CapabilitySet::V10_3 { flags: sf }) => CapabilitySet::V10_3 {
+            flags: (*cf & *sf) | (*cf & CapabilitiesV103Flags::AVC_DISABLED),
+        },
+        (CapabilitySet::V10_4 { flags: cf }, CapabilitySet::V10_4 { flags: sf }) => CapabilitySet::V10_4 {
+            flags: (*cf & *sf) | (*cf & CapabilitiesV104Flags::AVC_DISABLED),
+        },
+        (CapabilitySet::V10_5 { flags: cf }, CapabilitySet::V10_5 { flags: sf }) => CapabilitySet::V10_5 {
+            flags: (*cf & *sf) | (*cf & CapabilitiesV104Flags::AVC_DISABLED),
+        },
+        (CapabilitySet::V10_6 { flags: cf }, CapabilitySet::V10_6 { flags: sf }) => CapabilitySet::V10_6 {
+            flags: (*cf & *sf) | (*cf & CapabilitiesV104Flags::AVC_DISABLED),
+        },
+        (CapabilitySet::V10_6Err { flags: cf }, CapabilitySet::V10_6Err { flags: sf }) => CapabilitySet::V10_6Err {
+            flags: (*cf & *sf) | (*cf & CapabilitiesV104Flags::AVC_DISABLED),
+        },
+        (CapabilitySet::V10_7 { flags: cf }, CapabilitySet::V10_7 { flags: sf }) => CapabilitySet::V10_7 {
+            flags: (*cf & *sf) | (*cf & CapabilitiesV107Flags::AVC_DISABLED),
+        },
         // V10_1 has no flags; mismatched variants return server as-is.
         _ => server.clone(),
     }
+}
+
+/// Ensure a capabilities confirm never combines incompatible AVC flags.
+fn sanitize_capabilities_for_confirm(mut capabilities: CapabilitySet) -> CapabilitySet {
+    match &mut capabilities {
+        CapabilitySet::V10_3 { flags } => {
+            if flags.contains(CapabilitiesV103Flags::AVC_DISABLED) {
+                flags.remove(CapabilitiesV103Flags::AVC_THIN_CLIENT);
+            }
+        }
+        CapabilitySet::V10_4 { flags }
+        | CapabilitySet::V10_5 { flags }
+        | CapabilitySet::V10_6 { flags }
+        | CapabilitySet::V10_6Err { flags } => {
+            if flags.contains(CapabilitiesV104Flags::AVC_DISABLED) {
+                flags.remove(CapabilitiesV104Flags::AVC_THIN_CLIENT);
+            }
+        }
+        CapabilitySet::V10_7 { flags } => {
+            if flags.contains(CapabilitiesV107Flags::AVC_DISABLED) {
+                flags.remove(CapabilitiesV107Flags::AVC_THIN_CLIENT);
+            }
+        }
+        _ => {}
+    }
+
+    capabilities
 }
 
 // ============================================================================
@@ -790,13 +1061,38 @@ pub trait GraphicsPipelineHandler: Send {
 
     /// Returns the server's preferred capabilities
     ///
-    /// Override this to customize codec support. The default enables
-    /// AVC420/AVC444 with V10.7 and V8.1 as fallback.
+    /// Override this to customize codec support. The default declares every
+    /// capability version this build can interpret, in priority order, with
+    /// H.264 enabled from V8.1 up (V10 and later enable AVC by the absence
+    /// of `AVC_DISABLED`). Declaring the complete ladder matters because
+    /// negotiation matches exact versions: a client advertising only a
+    /// mid-tier version (Windows App builds do) would otherwise fail to
+    /// negotiate any V10-level set and lose H.264 or the channel entirely.
     fn preferred_capabilities(&self) -> Vec<CapabilitySet> {
         vec![
             CapabilitySet::V10_7 {
                 flags: CapabilitiesV107Flags::SMALL_CACHE,
             },
+            CapabilitySet::V10_6Err {
+                flags: CapabilitiesV104Flags::SMALL_CACHE,
+            },
+            CapabilitySet::V10_6 {
+                flags: CapabilitiesV104Flags::SMALL_CACHE,
+            },
+            CapabilitySet::V10_5 {
+                flags: CapabilitiesV104Flags::SMALL_CACHE,
+            },
+            CapabilitySet::V10_4 {
+                flags: CapabilitiesV104Flags::SMALL_CACHE,
+            },
+            CapabilitySet::V10_3 {
+                // V10.3 defines no SMALL_CACHE flag; empty means AVC enabled.
+                flags: CapabilitiesV103Flags::empty(),
+            },
+            CapabilitySet::V10_2 {
+                flags: CapabilitiesV10Flags::SMALL_CACHE,
+            },
+            CapabilitySet::V10_1,
             CapabilitySet::V10 {
                 flags: CapabilitiesV10Flags::SMALL_CACHE,
             },
@@ -880,9 +1176,9 @@ pub struct GraphicsPipelineServer {
 /// [`GraphicsPipelineServer::send_mixed_frame()`] to pack multiple codec
 /// types into a single `StartFrame`/`EndFrame` pair.
 ///
-/// Marked `#[non_exhaustive]` so future EGFX codec additions (for example,
-/// Avc444 or hardware-accelerated paths) can land without a SemVer break
-/// for downstream consumers that pattern-match on this enum.
+/// Marked `#[non_exhaustive]` so future EGFX codec additions can land
+/// without a SemVer break for downstream consumers that pattern-match on
+/// this enum.
 #[non_exhaustive]
 pub enum MixedTilePayload {
     /// Lossless ClearCodec tile (text, UI elements, icons).
@@ -905,6 +1201,45 @@ pub enum MixedTilePayload {
         regions: Vec<Avc420Region>,
         h264_data: Vec<u8>,
     },
+    /// H.264 AVC444 tile (`RFX_AVC444_BITMAP_STREAM`, MS-RDPEGFX 2.2.4.5).
+    Avc444(Avc444Tile),
+    /// H.264 AVC444v2 tile (`RFX_AVC444V2_BITMAP_STREAM`, MS-RDPEGFX 2.2.4.6).
+    ///
+    /// Identical on the wire to [`MixedTilePayload::Avc444`] except for how
+    /// the client combines the two views, so it takes the same [`Avc444Tile`].
+    Avc444v2(Avc444Tile),
+}
+
+/// One H.264 sub-stream of an [`Avc444Tile`]: the regions it covers and its
+/// data, which together are one `RFX_AVC420_BITMAP_STREAM`.
+pub struct Avc444SubStream {
+    pub regions: Vec<Avc420Region>,
+    pub data: Vec<u8>,
+}
+
+/// The fields of an AVC444 or AVC444v2 tile in a mixed-codec frame.
+///
+/// They mirror [`GraphicsPipelineServer::send_avc444v2_frame()`]: `encoding` is
+/// the LC value, and the second sub-stream, `stream2`, is present exactly when it
+/// is `LUMA_AND_CHROMA`. The regions and the data of the second sub-stream travel
+/// together in one [`Avc444SubStream`], so a tile can't hold one without the
+/// other. Each sub-stream keeps its own regions because each is a full
+/// `RFX_AVC420_BITMAP_STREAM`.
+///
+/// MS-RDPEGFX 2.2.3.7 guarantees same-frame mixing only for AVC in YUV420
+/// mode, so no capability version promises that a client decodes AVC444 next to
+/// other codecs. [`GraphicsPipelineServer::send_mixed_frame()`] still holds it
+/// to the 10.4 floor that applies to AVC420, which you can check beforehand with
+/// [`CodecCapabilities::avc420_in_mixed_frames`] from
+/// [`GraphicsPipelineServer::codec_capabilities()`], and you should test the
+/// clients you target. An LC `CHROMA` update is combined with previously decoded luma
+/// (2.2.4.5), so it must not cover an area another codec has repainted since
+/// that area's last luma update.
+pub struct Avc444Tile {
+    pub encoding: Encoding,
+    pub stream1_regions: Vec<Avc420Region>,
+    pub stream1_data: Vec<u8>,
+    pub stream2: Option<Avc444SubStream>,
 }
 
 impl GraphicsPipelineServer {
@@ -932,12 +1267,32 @@ impl GraphicsPipelineServer {
         }
     }
 
+    /// Reset all state owned by one DVC channel generation.
+    fn reset_channel_state(&mut self) {
+        self.negotiated_caps = None;
+        self.codec_caps = CodecCapabilities::default();
+        self.surfaces = Surfaces::new();
+        self.frames.clear();
+        self.output_width = 0;
+        self.output_height = 0;
+        self.reset_graphics_sent = false;
+        self.output_queue.clear();
+        self.channel_id = None;
+        self.zgfx_compressor = Compressor::new();
+        self.qoe.clear();
+    }
+
     /// Create a server with ZGFX compression enabled for output.
     ///
     /// When `compression_mode` is `Auto` or `Always`, `drain_output()` will
     /// compress PDUs before ZGFX wrapping, reducing bandwidth at the cost
     /// of CPU. The compressor maintains a sliding history window across
-    /// frames for back-reference efficiency.
+    /// frames for back-reference efficiency. `WireToSurface1` PDUs carrying
+    /// AVC420, AVC444 or AVC444v2 are sent uncompressed in both modes, since
+    /// H.264 is already entropy coded; their bytes still enter the history.
+    /// The trade-off is that a byte-identical repeat of an earlier H.264 PDU,
+    /// such as a periodic keyframe of an unchanged screen, is sent in full where
+    /// ZGFX would have matched it against the history.
     pub fn with_compression(handler: Box<dyn GraphicsPipelineHandler>, compression_mode: CompressionMode) -> Self {
         let mut server = Self::new(handler);
         server.compression_mode = compression_mode;
@@ -1152,7 +1507,7 @@ impl GraphicsPipelineServer {
             self.delete_surface(id);
         }
 
-        self.frames.clear();
+        self.frames.clear_pending_frames();
 
         self.output_queue.push_back(GfxPdu::ResetGraphics(ResetGraphicsPdu {
             width: u32::from(width),
@@ -1189,9 +1544,24 @@ impl GraphicsPipelineServer {
         self.frames.client_queue_depth()
     }
 
-    /// Set the maximum frames in flight before backpressure
+    /// Set the maximum frames in flight before backpressure.
     pub fn set_max_frames_in_flight(&mut self, max: u32) {
         self.frames.set_max_in_flight(max);
+    }
+
+    /// Replace the current connection's core Frame Acknowledge ceiling.
+    ///
+    /// The ceiling survives DVC close/reopen and resize. Apply this for every
+    /// capability exchange, including reactivation; `None` clears the constraint.
+    pub fn set_client_frame_ack_limit(&mut self, client_max: Option<NonZeroU32>) -> u32 {
+        self.frames.client_max_in_flight = client_max;
+        self.frames.max_in_flight()
+    }
+
+    /// Effective maximum number of frames in flight.
+    #[must_use]
+    pub fn max_frames_in_flight(&self) -> u32 {
+        self.frames.max_in_flight()
     }
 
     // ========================================================================
@@ -1243,9 +1613,8 @@ impl GraphicsPipelineServer {
 
     /// Compute bounding rectangle from regions.
     ///
-    /// Avc420Region uses inclusive bounds; the wire format (RDPGFX_RECT16) is
-    /// exclusive, so the returned ExclusiveRectangle adds 1 to the max right
-    /// and bottom of the inclusive bounding box.
+    /// `Avc420Region` and the wire-format `RDPGFX_RECT16` both use exclusive
+    /// right and bottom bounds.
     fn compute_dest_rect(regions: &[Avc420Region], default_width: u16, default_height: u16) -> ExclusiveRectangle {
         if let Some(first) = regions.first() {
             let mut left = first.left;
@@ -1263,8 +1632,8 @@ impl GraphicsPipelineServer {
             ExclusiveRectangle {
                 left,
                 top,
-                right: right.saturating_add(1),
-                bottom: bottom.saturating_add(1),
+                right,
+                bottom,
             }
         } else {
             ExclusiveRectangle {
@@ -1276,40 +1645,91 @@ impl GraphicsPipelineServer {
         }
     }
 
-    /// Queue an H.264 AVC420 frame for transmission
+    /// Whether an exclusive rectangle is non-empty and lies inside the surface.
+    fn rect_fits_surface(surface: &Surface, rect: &ExclusiveRectangle) -> bool {
+        rect.left < rect.right && rect.top < rect.bottom && rect.right <= surface.width && rect.bottom <= surface.height
+    }
+
+    /// Readiness, codec support, backpressure and surface lookup, in that order.
     ///
-    /// Returns `Some(frame_id)` if queued, `None` if backpressure is active,
-    /// server not ready, or AVC420 not supported.
-    pub fn send_avc420_frame(
+    /// `require_codec` runs after the readiness check and before the backpressure
+    /// check, so a sender that needs a codec capability reports it ahead of
+    /// backpressure, and a sender that needs none passes a check that always succeeds.
+    fn surface_for_submission(
+        &self,
+        surface_id: u16,
+        require_codec: impl FnOnce(&Self) -> Result<(), FrameSubmissionError>,
+    ) -> Result<&Surface, FrameSubmissionError> {
+        if !self.is_ready() {
+            return Err(FrameSubmissionError::NotReady);
+        }
+        require_codec(self)?;
+        if self.should_backpressure() {
+            return Err(FrameSubmissionError::Backpressured {
+                frames_in_flight: self.frames.in_flight(),
+                max_frames_in_flight: self.frames.max_in_flight(),
+            });
+        }
+        self.surfaces
+            .get(surface_id)
+            .ok_or(FrameSubmissionError::UnknownSurface { surface_id })
+    }
+
+    fn require_avc(&self, avc444: bool) -> Result<(), FrameSubmissionError> {
+        if avc444 && !self.supports_avc444() {
+            Err(FrameSubmissionError::Avc444Unsupported)
+        } else if !avc444 && !self.supports_avc420() {
+            Err(FrameSubmissionError::Avc420Unsupported)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn submission_state(&self, surface_id: u16, avc444: bool) -> Result<&Surface, FrameSubmissionError> {
+        self.surface_for_submission(surface_id, |server| server.require_avc(avc444))
+    }
+
+    /// Inspect AVC420 readiness without queueing a frame.
+    pub fn avc420_submission_state(&self, surface_id: u16) -> Result<(), FrameSubmissionError> {
+        self.submission_state(surface_id, false).map(|_| ())
+    }
+
+    fn prepare_submission(&mut self, surface_id: u16, avc444: bool) -> Result<Surface, FrameSubmissionError> {
+        self.prepare_with(surface_id, |server| server.require_avc(avc444))
+    }
+
+    /// Run the shared submission checks with the caller's codec requirement, count a
+    /// backpressure rejection in the QoE record, and return a copy of the surface.
+    fn prepare_with(
+        &mut self,
+        surface_id: u16,
+        require_codec: impl FnOnce(&Self) -> Result<(), FrameSubmissionError>,
+    ) -> Result<Surface, FrameSubmissionError> {
+        // Copy the small descriptor so validation and QoE accounting use one lookup.
+        let result = self.surface_for_submission(surface_id, require_codec).cloned();
+        if matches!(result, Err(FrameSubmissionError::Backpressured { .. })) {
+            self.qoe.record_backpressure();
+        }
+        result
+    }
+
+    /// Queue an H.264 AVC420 frame for transmission with a typed rejection.
+    pub fn try_send_avc420_frame(
         &mut self,
         surface_id: u16,
         h264_data: &[u8],
         regions: &[Avc420Region],
         timestamp_ms: u32,
-    ) -> Option<u32> {
-        if !self.is_ready() {
-            return None;
-        }
-        if !self.supports_avc420() {
-            return None;
-        }
-        if self.should_backpressure() {
-            self.qoe.record_backpressure();
-            return None;
-        }
-
-        let surface = self.surfaces.get(surface_id)?;
-
+    ) -> Result<u32, FrameSubmissionError> {
+        let surface = self.prepare_submission(surface_id, false)?;
         let timestamp = Self::make_timestamp(timestamp_ms);
         let frame_id = self.frames.begin_frame(timestamp);
-
         let encoded_stream = encode_avc420_bitmap_stream(regions, h264_data);
         let target_rect = Self::compute_dest_rect(regions, surface.width, surface.height);
 
-        // MS-RDPEGFX requires three-PDU sequence per frame
+        // MS-RDPEGFX requires three-PDU sequence per frame.
         self.output_queue
             .push_back(GfxPdu::StartFrame(StartFramePdu { timestamp, frame_id }));
-
         self.output_queue.push_back(GfxPdu::WireToSurface1(WireToSurface1Pdu {
             surface_id,
             codec_id: Codec1Type::Avc420,
@@ -1317,18 +1737,61 @@ impl GraphicsPipelineServer {
             destination_rectangle: target_rect,
             bitmap_data: encoded_stream,
         }));
-
         self.output_queue.push_back(GfxPdu::EndFrame(EndFramePdu { frame_id }));
 
-        Some(frame_id)
+        Ok(frame_id)
     }
 
-    /// Queue an H.264 AVC444 frame for transmission
+    /// Compatibility wrapper returning `None` for any submission rejection.
+    pub fn send_avc420_frame(
+        &mut self,
+        surface_id: u16,
+        h264_data: &[u8],
+        regions: &[Avc420Region],
+        timestamp_ms: u32,
+    ) -> Option<u32> {
+        self.try_send_avc420_frame(surface_id, h264_data, regions, timestamp_ms)
+            .ok()
+    }
+
+    /// Inspect AVC444 readiness without queueing a frame.
+    pub fn avc444_submission_state(&self, surface_id: u16) -> Result<(), FrameSubmissionError> {
+        self.submission_state(surface_id, true).map(|_| ())
+    }
+
+    /// Queue an H.264 AVC444 frame for transmission with a typed rejection.
     ///
     /// AVC444 uses two streams: luma (Y) and chroma (UV). Set `chroma_data` to
     /// `None` for luma-only transmission.
-    ///
-    /// Returns `Some(frame_id)` if queued, `None` if not supported or backpressured.
+    pub fn try_send_avc444_frame(
+        &mut self,
+        surface_id: u16,
+        luma_data: &[u8],
+        luma_regions: &[Avc420Region],
+        chroma_data: Option<&[u8]>,
+        chroma_regions: Option<&[Avc420Region]>,
+        timestamp_ms: u32,
+    ) -> Result<u32, FrameSubmissionError> {
+        let (encoding, stream2_data, stream2_regions) =
+            if let (Some(chroma_data), Some(chroma_regions)) = (chroma_data, chroma_regions) {
+                (Encoding::LUMA_AND_CHROMA, Some(chroma_data), Some(chroma_regions))
+            } else {
+                (Encoding::LUMA, None, None)
+            };
+
+        self.try_send_avc444_frame_with_encoding(
+            Codec1Type::Avc444,
+            surface_id,
+            encoding,
+            luma_data,
+            luma_regions,
+            stream2_data,
+            stream2_regions,
+            timestamp_ms,
+        )
+    }
+
+    /// Compatibility wrapper returning `None` for any submission rejection.
     pub fn send_avc444_frame(
         &mut self,
         surface_id: u16,
@@ -1338,10 +1801,235 @@ impl GraphicsPipelineServer {
         chroma_regions: Option<&[Avc420Region]>,
         timestamp_ms: u32,
     ) -> Option<u32> {
-        if !self.is_ready() {
-            return None;
+        self.try_send_avc444_frame(
+            surface_id,
+            luma_data,
+            luma_regions,
+            chroma_data,
+            chroma_regions,
+            timestamp_ms,
+        )
+        .ok()
+    }
+
+    /// Compatibility wrapper returning `None` for any AVC444v2 rejection.
+    ///
+    /// `encoding` selects the AVC444v2 stream layout: LC=0 carries luma in
+    /// stream 1 and chroma in stream 2, LC=1 carries luma in stream 1, and LC=2
+    /// carries chroma in stream 1.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the public API mirrors the two AVC444v2 streams"
+    )]
+    pub fn send_avc444v2_frame(
+        &mut self,
+        surface_id: u16,
+        encoding: Encoding,
+        stream1_data: &[u8],
+        stream1_regions: &[Avc420Region],
+        stream2_data: Option<&[u8]>,
+        stream2_regions: Option<&[Avc420Region]>,
+        timestamp_ms: u32,
+    ) -> Option<u32> {
+        self.try_send_avc444v2_frame(
+            surface_id,
+            encoding,
+            stream1_data,
+            stream1_regions,
+            stream2_data,
+            stream2_regions,
+            timestamp_ms,
+        )
+        .ok()
+    }
+
+    /// Queue an AVC444v2 frame with a typed submission rejection.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the public API mirrors the two AVC444v2 streams"
+    )]
+    pub fn try_send_avc444v2_frame(
+        &mut self,
+        surface_id: u16,
+        encoding: Encoding,
+        stream1_data: &[u8],
+        stream1_regions: &[Avc420Region],
+        stream2_data: Option<&[u8]>,
+        stream2_regions: Option<&[Avc420Region]>,
+        timestamp_ms: u32,
+    ) -> Result<u32, FrameSubmissionError> {
+        self.try_send_avc444_frame_with_encoding(
+            Codec1Type::Avc444v2,
+            surface_id,
+            encoding,
+            stream1_data,
+            stream1_regions,
+            stream2_data,
+            stream2_regions,
+            timestamp_ms,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the shared implementation receives both AVC444 streams"
+    )]
+    fn try_send_avc444_frame_with_encoding(
+        &mut self,
+        codec_id: Codec1Type,
+        surface_id: u16,
+        encoding: Encoding,
+        stream1_data: &[u8],
+        stream1_regions: &[Avc420Region],
+        stream2_data: Option<&[u8]>,
+        stream2_regions: Option<&[Avc420Region]>,
+        timestamp_ms: u32,
+    ) -> Result<u32, FrameSubmissionError> {
+        // A second sub-stream is its regions and its data together; one without the
+        // other is never valid.
+        let stream2 = match (stream2_regions, stream2_data) {
+            (Some(regions), Some(data)) => Some((regions, data)),
+            (None, None) => None,
+            _ => return Err(FrameSubmissionError::InvalidFrame),
+        };
+        if !Self::avc444_stream_shape_is_valid(encoding, stream2.is_some()) {
+            return Err(FrameSubmissionError::InvalidFrame);
         }
-        if !self.supports_avc444() {
+        let surface = self.prepare_submission(surface_id, true)?;
+        let timestamp = Self::make_timestamp(timestamp_ms);
+        let frame_id = self.frames.begin_frame(timestamp);
+        let wire_pdu = Self::avc444_wire_pdu(codec_id, &surface, encoding, (stream1_regions, stream1_data), stream2);
+
+        self.output_queue
+            .push_back(GfxPdu::StartFrame(StartFramePdu { timestamp, frame_id }));
+        self.output_queue.push_back(GfxPdu::WireToSurface1(wire_pdu));
+        self.output_queue.push_back(GfxPdu::EndFrame(EndFramePdu { frame_id }));
+
+        Ok(frame_id)
+    }
+
+    /// Whether the second AVC444 sub-stream is present exactly when the LC
+    /// value calls for it; LC 3 is invalid (MS-RDPEGFX 2.2.4.5).
+    fn avc444_stream_shape_is_valid(encoding: Encoding, has_stream2: bool) -> bool {
+        if encoding == Encoding::LUMA_AND_CHROMA {
+            has_stream2
+        } else if encoding == Encoding::LUMA || encoding == Encoding::CHROMA {
+            !has_stream2
+        } else {
+            false
+        }
+    }
+
+    /// Build the `WireToSurface1` PDU for an AVC444 or AVC444v2 update whose
+    /// stream shape has already been checked.
+    fn avc444_wire_pdu<'a>(
+        codec_id: Codec1Type,
+        surface: &Surface,
+        encoding: Encoding,
+        stream1: (&[Avc420Region], &'a [u8]),
+        stream2: Option<(&[Avc420Region], &'a [u8])>,
+    ) -> WireToSurface1Pdu {
+        let substream = |(regions, data): (&[Avc420Region], &'a [u8])| Avc420BitmapStream {
+            rectangles: regions.iter().map(Avc420Region::to_rectangle).collect(),
+            quant_qual_vals: regions.iter().map(Avc420Region::to_quant_quality).collect(),
+            data,
+        };
+
+        let avc444_stream = Avc444BitmapStream {
+            encoding,
+            stream1: substream(stream1),
+            stream2: stream2.map(substream),
+        };
+
+        // destRect is the bounding rectangle of both sub-streams (MS-RDPEGFX 2.2.2.1).
+        let destination_rectangle = match stream2 {
+            Some((stream2_regions, _)) => {
+                Self::compute_dest_rect_for_streams(stream1.0, stream2_regions, surface.width, surface.height)
+            }
+            None => Self::compute_dest_rect(stream1.0, surface.width, surface.height),
+        };
+
+        WireToSurface1Pdu {
+            surface_id: surface.id,
+            codec_id,
+            pixel_format: surface.pixel_format,
+            destination_rectangle,
+            bitmap_data: encode_avc444_bitmap_stream(&avc444_stream),
+        }
+    }
+
+    /// Build the `WireToSurface1` PDU for an AVC444 or AVC444v2 mixed-frame tile
+    /// whose shape has already been checked.
+    fn avc444_tile_pdu(codec_id: Codec1Type, surface: &Surface, tile: &Avc444Tile) -> WireToSurface1Pdu {
+        Self::avc444_wire_pdu(
+            codec_id,
+            surface,
+            tile.encoding,
+            (&tile.stream1_regions, &tile.stream1_data),
+            tile.stream2
+                .as_ref()
+                .map(|stream2| (stream2.regions.as_slice(), stream2.data.as_slice())),
+        )
+    }
+
+    /// Why the regions of one AVC420 tile or one AVC444 sub-stream can't be sent
+    /// in a mixed frame, if they can't: the list is empty, a region is empty or
+    /// outside the surface, or a QP or quality is outside the ranges of
+    /// MS-RDPEGFX 2.2.4.4.2.
+    fn avc_regions_refusal(surface: &Surface, regions: &[Avc420Region]) -> Option<&'static str> {
+        if regions.is_empty() {
+            return Some("AVC tile has no regions");
+        }
+        if regions
+            .iter()
+            .any(|region| !Self::rect_fits_surface(surface, &region.to_rectangle()))
+        {
+            return Some("AVC region is empty or outside the surface");
+        }
+        if regions
+            .iter()
+            .any(|region| MAX_AVC_QP < region.quantization_parameter || MAX_AVC_QUALITY < region.quality)
+        {
+            return Some("AVC QP or quality is out of range");
+        }
+
+        None
+    }
+
+    fn compute_dest_rect_for_streams(
+        stream1_regions: &[Avc420Region],
+        stream2_regions: &[Avc420Region],
+        default_width: u16,
+        default_height: u16,
+    ) -> ExclusiveRectangle {
+        let stream1 = Self::compute_dest_rect(stream1_regions, default_width, default_height);
+        let stream2 = Self::compute_dest_rect(stream2_regions, default_width, default_height);
+
+        ExclusiveRectangle {
+            left: stream1.left.min(stream2.left),
+            top: stream1.top.min(stream2.top),
+            right: stream1.right.max(stream2.right),
+            bottom: stream1.bottom.max(stream2.bottom),
+        }
+    }
+
+    /// Queue a pre-encoded RDP6 Planar bitmap stream for transmission via EGFX.
+    ///
+    /// `planar_data` must represent a bitmap with the supplied destination
+    /// dimensions and use the target surface's pixel format.
+    ///
+    /// Returns `Some(frame_id)` if queued, `None` if the server is not ready,
+    /// the surface does not exist, the destination exceeds the surface, or
+    /// backpressure is active.
+    pub fn send_planar_frame(
+        &mut self,
+        surface_id: u16,
+        planar_data: &[u8],
+        dest_width: u16,
+        dest_height: u16,
+        timestamp_ms: u32,
+    ) -> Option<u32> {
+        if !self.is_ready() {
             return None;
         }
         if self.should_backpressure() {
@@ -1350,53 +2038,28 @@ impl GraphicsPipelineServer {
         }
 
         let surface = self.surfaces.get(surface_id)?;
+        if dest_width > surface.width || dest_height > surface.height {
+            return None;
+        }
 
         let timestamp = Self::make_timestamp(timestamp_ms);
         let frame_id = self.frames.begin_frame(timestamp);
-
-        let luma_rectangles: Vec<_> = luma_regions.iter().map(Avc420Region::to_rectangle).collect();
-        let luma_quant_vals: Vec<_> = luma_regions.iter().map(Avc420Region::to_quant_quality).collect();
-
-        let stream1 = Avc420BitmapStream {
-            rectangles: luma_rectangles,
-            quant_qual_vals: luma_quant_vals,
-            data: luma_data,
+        let destination_rectangle = ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: dest_width,
+            bottom: dest_height,
         };
-
-        let (encoding, stream2) = if let (Some(chroma), Some(chroma_regs)) = (chroma_data, chroma_regions) {
-            let chroma_rectangles: Vec<_> = chroma_regs.iter().map(Avc420Region::to_rectangle).collect();
-            let chroma_quant_vals: Vec<_> = chroma_regs.iter().map(Avc420Region::to_quant_quality).collect();
-
-            (
-                Encoding::LUMA_AND_CHROMA,
-                Some(Avc420BitmapStream {
-                    rectangles: chroma_rectangles,
-                    quant_qual_vals: chroma_quant_vals,
-                    data: chroma,
-                }),
-            )
-        } else {
-            (Encoding::LUMA, None)
-        };
-
-        let avc444_stream = Avc444BitmapStream {
-            encoding,
-            stream1,
-            stream2,
-        };
-
-        let encoded_stream = encode_avc444_bitmap_stream(&avc444_stream);
-        let target_rect = Self::compute_dest_rect(luma_regions, surface.width, surface.height);
 
         self.output_queue
             .push_back(GfxPdu::StartFrame(StartFramePdu { timestamp, frame_id }));
 
         self.output_queue.push_back(GfxPdu::WireToSurface1(WireToSurface1Pdu {
             surface_id,
-            codec_id: Codec1Type::Avc444,
+            codec_id: Codec1Type::Planar,
             pixel_format: surface.pixel_format,
-            destination_rectangle: target_rect,
-            bitmap_data: encoded_stream,
+            destination_rectangle,
+            bitmap_data: planar_data.to_vec(),
         }));
 
         self.output_queue.push_back(GfxPdu::EndFrame(EndFramePdu { frame_id }));
@@ -1410,6 +2073,9 @@ impl GraphicsPipelineServer {
     /// Used for V8 clients that support EGFX but not H.264 (AVC420/AVC444).
     ///
     /// The `bitmap_data` should be in the surface's pixel format (typically XRGB).
+    ///
+    /// Always places the bitmap at the surface origin. To send only the part of a
+    /// frame that changed, use [`Self::try_send_uncompressed_region()`].
     ///
     /// Returns `Some(frame_id)` if queued, `None` if not ready or backpressured.
     pub fn send_uncompressed_frame(
@@ -1456,6 +2122,75 @@ impl GraphicsPipelineServer {
         Some(frame_id)
     }
 
+    /// Queue part of a frame as an uncompressed bitmap, with a typed rejection.
+    ///
+    /// Sends `bitmap_data` through `WireToSurface1` with `Codec1Type::Uncompressed`,
+    /// placed at `region` instead of at the surface origin, so a caller that knows
+    /// which part of the screen changed can send only that part. A client that
+    /// decodes no compressed codec otherwise receives the whole frame for every
+    /// update, 8 MB at 1920x1080.
+    ///
+    /// `bitmap_data` holds the rows of `region` in the surface's pixel format, four
+    /// bytes a pixel and no row padding. `region` uses exclusive right and bottom
+    /// bounds, like the wire-format `RDPGFX_RECT16`.
+    ///
+    /// An empty region, a region that doesn't lie inside the surface and a payload
+    /// whose length isn't the region's area are rejected with
+    /// [`FrameSubmissionError::InvalidFrame`], because the client can't place such a
+    /// bitmap. An empty region or a wrong payload length is reported before readiness
+    /// and backpressure, so those never hide it; whether the region lies inside the
+    /// surface can only be known after the surface lookup.
+    ///
+    /// The payload still goes through the ZGFX stage of [`Self::drain_output()`]. With
+    /// the default [`CompressionMode::Never`] it is sent as is. With `Auto` or
+    /// `Always` the compressor runs over the whole payload before the single-segment
+    /// size check, so the CPU cost grows with the area of `region`. Keep compression
+    /// off, or send small regions, where that cost matters.
+    pub fn try_send_uncompressed_region(
+        &mut self,
+        surface_id: u16,
+        bitmap_data: &[u8],
+        region: ExclusiveRectangle,
+        timestamp_ms: u32,
+    ) -> Result<u32, FrameSubmissionError> {
+        // The checks that depend only on the arguments come first, as in the AVC444
+        // sender, so `InvalidFrame` doesn't vary with readiness or backpressure and a
+        // malformed region isn't counted as a backpressure rejection.
+        if region.left >= region.right || region.top >= region.bottom {
+            return Err(FrameSubmissionError::InvalidFrame);
+        }
+        // INVARIANT: the check above established that both extents are positive.
+        let area = usize::from(region.right - region.left) * usize::from(region.bottom - region.top);
+        if area.checked_mul(UNCOMPRESSED_BYTES_PER_PIXEL) != Some(bitmap_data.len()) {
+            return Err(FrameSubmissionError::InvalidFrame);
+        }
+
+        // No codec capability is required: the point of this sender is a client that
+        // decodes no compressed codec.
+        let surface = self.prepare_with(surface_id, |_| Ok(()))?;
+        // Whether the region lies inside the surface needs the surface, so it follows
+        // the lookup.
+        if !Self::rect_fits_surface(&surface, &region) {
+            return Err(FrameSubmissionError::InvalidFrame);
+        }
+
+        let timestamp = Self::make_timestamp(timestamp_ms);
+        let frame_id = self.frames.begin_frame(timestamp);
+
+        self.output_queue
+            .push_back(GfxPdu::StartFrame(StartFramePdu { timestamp, frame_id }));
+        self.output_queue.push_back(GfxPdu::WireToSurface1(WireToSurface1Pdu {
+            surface_id,
+            codec_id: Codec1Type::Uncompressed,
+            pixel_format: surface.pixel_format,
+            destination_rectangle: region,
+            bitmap_data: bitmap_data.to_vec(),
+        }));
+        self.output_queue.push_back(GfxPdu::EndFrame(EndFramePdu { frame_id }));
+
+        Ok(frame_id)
+    }
+
     /// Queue a RemoteFX Progressive frame for transmission.
     ///
     /// Progressive frames use `WireToSurface2Pdu` with a pre-encoded progressive
@@ -1478,6 +2213,7 @@ impl GraphicsPipelineServer {
             return None;
         }
         if self.should_backpressure() {
+            self.qoe.record_backpressure();
             return None;
         }
 
@@ -1502,6 +2238,52 @@ impl GraphicsPipelineServer {
         Some(frame_id)
     }
 
+    /// Queue a ClearCodec frame for transmission.
+    ///
+    /// ClearCodec is a mandatory lossless codec for all EGFX versions. It
+    /// provides excellent compression for text, UI elements, and icons.
+    ///
+    /// `bitmap_data` should be a pre-encoded ClearCodec bitmap stream
+    /// (as produced by `ironrdp_graphics::clearcodec::ClearCodecEncoder`).
+    ///
+    /// Returns `Some(frame_id)` if queued, `None` if backpressure is active
+    /// or the server is not ready.
+    pub fn send_clearcodec_frame(
+        &mut self,
+        surface_id: u16,
+        destination_rectangle: ExclusiveRectangle,
+        bitmap_data: Vec<u8>,
+        timestamp_ms: u32,
+    ) -> Option<u32> {
+        if !self.is_ready() {
+            return None;
+        }
+        if self.should_backpressure() {
+            self.qoe.record_backpressure();
+            return None;
+        }
+
+        let surface = self.surfaces.get(surface_id)?;
+
+        let timestamp = Self::make_timestamp(timestamp_ms);
+        let frame_id = self.frames.begin_frame(timestamp);
+
+        self.output_queue
+            .push_back(GfxPdu::StartFrame(StartFramePdu { timestamp, frame_id }));
+
+        self.output_queue.push_back(GfxPdu::WireToSurface1(WireToSurface1Pdu {
+            surface_id,
+            codec_id: Codec1Type::ClearCodec,
+            pixel_format: surface.pixel_format,
+            destination_rectangle,
+            bitmap_data,
+        }));
+
+        self.output_queue.push_back(GfxPdu::EndFrame(EndFramePdu { frame_id }));
+
+        Some(frame_id)
+    }
+
     // ========================================================================
     // Mixed-Codec Frame Support
     // ========================================================================
@@ -1512,10 +2294,43 @@ impl GraphicsPipelineServer {
     /// ClearCodec tiles (lossless text), Progressive tiles (photos), and H.264
     /// tiles (video), all sent between one `StartFrame`/`EndFrame` pair.
     ///
-    /// This matches how Azure VDI achieves its visual quality — each tile uses
-    /// the codec best suited to its content type.
+    /// MS-RDPEGFX [3.3.5.1] (processing an `RDPGFX_WIRE_TO_SURFACE_PDU_1`
+    /// message) has the client copy a decoded ClearCodec or AVC420 tile to the
+    /// surface when it processes the PDU, so where two such tiles overlap the
+    /// one sent later is what remains. A Progressive tile follows [3.3.5.2]
+    /// instead, which only says it SHOULD be copied once enough of it is
+    /// decoded and updated as later PDUs arrive, so the spec doesn't order it
+    /// against an overlapping tile. MS-RDPEGFX [2.2.3.7] requires a client that
+    /// did not set `AVC_DISABLED` at capability version 10.4 or later to process
+    /// AVC420 in the same frame as other codecs; earlier capability versions
+    /// make no such promise. [`CodecCapabilities::avc420_in_mixed_frames`]
+    /// reports whether the negotiated set makes it.
     ///
-    /// Returns `Some(frame_id)` if queued, `None` if not ready or backpressured.
+    /// Every tile is checked before the frame is queued. AVC420 tiles need
+    /// AVC420 support in the negotiated capabilities and AVC444 tiles need
+    /// AVC444 support; an AVC444 tile's second sub-stream must be present
+    /// exactly when its LC is `LUMA_AND_CHROMA`. A frame that mixes an AVC tile
+    /// (AVC420, AVC444 or AVC444v2) with a tile of another codec needs
+    /// capability version 10.4 or later. The spec promises that only for
+    /// AVC420, and only from there; AVC444 beside another codec is held to the
+    /// same floor because no version promises it at all. A frame whose tiles
+    /// all use one codec is not covered by it. Each AVC tile needs at least one
+    /// region, and so does the second sub-stream of an AVC444 tile, unlike
+    /// [`Self::send_avc420_frame()`], which reads an empty list as the whole
+    /// surface: a whole-surface tile would cover the tiles sent before it. Each
+    /// AVC region and ClearCodec destination must be non-empty and inside the
+    /// surface. AVC regions also need a QP of at most 51 (for 8-bit video) and
+    /// a quality of at most 100 (MS-RDPEGFX [2.2.4.4.2]). If any check fails
+    /// nothing is queued and no frame is tracked.
+    ///
+    /// Returns `Some(frame_id)` if queued, `None` if not ready, backpressured,
+    /// or a tile failed its checks. A refusal because of the tiles or the
+    /// negotiated capabilities logs its reason at trace level.
+    ///
+    /// [3.3.5.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/3fdfcd8d-ec4f-4b7a-8e0d-0385a840ec81
+    /// [3.3.5.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/9791fc34-7644-4279-844f-7728ae9959c2
+    /// [2.2.3.7]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/be5ea8da-44db-478d-b55c-d42d82f11d26
+    /// [2.2.4.4.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/bc54993f-2e3c-4285-b32b-58a4bf4cb02e
     pub fn send_mixed_frame(
         &mut self,
         surface_id: u16,
@@ -1526,14 +2341,68 @@ impl GraphicsPipelineServer {
             return None;
         }
         if self.should_backpressure() {
+            self.qoe.record_backpressure();
             return None;
         }
         if tiles.is_empty() {
             return None;
         }
 
+        let is_avc420 = |tile: &MixedTilePayload| matches!(tile, MixedTilePayload::Avc420 { .. });
+        if tiles.iter().any(is_avc420) && !self.supports_avc420() {
+            trace!(
+                reason = "AVC420 is not supported by the negotiated capabilities",
+                "Mixed frame refused"
+            );
+            return None;
+        }
+
+        // Tiles of one codec family are never a mix; an AVC tile beside a tile of
+        // another family needs the 10.4 floor (AVC444 and AVC444v2 count as one family).
+        let family = |tile: &MixedTilePayload| match tile {
+            MixedTilePayload::ClearCodec { .. } => 0,
+            MixedTilePayload::RemoteFxProgressive { .. } => 1,
+            MixedTilePayload::Avc420 { .. } => 2,
+            MixedTilePayload::Avc444(_) | MixedTilePayload::Avc444v2(_) => 3,
+        };
+        let has_avc = tiles.iter().any(|tile| 2 <= family(tile));
+        let mixes_codecs = tiles.iter().any(|tile| family(tile) != family(&tiles[0]));
+        if has_avc && mixes_codecs && !self.codec_caps.avc420_in_mixed_frames {
+            trace!(
+                reason = "AVC beside another codec is not promised by the negotiated capabilities",
+                "Mixed frame refused"
+            );
+            return None;
+        }
+
+        let supports_avc444 = self.supports_avc444();
         let surface = self.surfaces.get(surface_id)?;
         let pixel_format = surface.pixel_format;
+
+        let refusal = tiles.iter().find_map(|tile| match tile {
+            MixedTilePayload::ClearCodec { destination, .. } => (!Self::rect_fits_surface(surface, destination))
+                .then_some("ClearCodec destination is empty or outside the surface"),
+            MixedTilePayload::RemoteFxProgressive { .. } => None,
+            MixedTilePayload::Avc420 { regions, .. } => Self::avc_regions_refusal(surface, regions),
+            MixedTilePayload::Avc444(tile) | MixedTilePayload::Avc444v2(tile) => {
+                if !supports_avc444 {
+                    return Some("AVC444 is not supported by the negotiated capabilities");
+                }
+                if !Self::avc444_stream_shape_is_valid(tile.encoding, tile.stream2.is_some()) {
+                    return Some("AVC444 second sub-stream does not match the LC value");
+                }
+
+                Self::avc_regions_refusal(surface, &tile.stream1_regions).or_else(|| {
+                    tile.stream2
+                        .as_ref()
+                        .and_then(|stream2| Self::avc_regions_refusal(surface, &stream2.regions))
+                })
+            }
+        });
+        if let Some(reason) = refusal {
+            trace!(reason, "Mixed frame refused");
+            return None;
+        }
 
         let timestamp = Self::make_timestamp(timestamp_ms);
         let frame_id = self.frames.begin_frame(timestamp);
@@ -1579,6 +2448,22 @@ impl GraphicsPipelineServer {
                         bitmap_data: encoded_stream,
                     }));
                 }
+                MixedTilePayload::Avc444(tile) => {
+                    self.output_queue
+                        .push_back(GfxPdu::WireToSurface1(Self::avc444_tile_pdu(
+                            Codec1Type::Avc444,
+                            surface,
+                            &tile,
+                        )));
+                }
+                MixedTilePayload::Avc444v2(tile) => {
+                    self.output_queue
+                        .push_back(GfxPdu::WireToSurface1(Self::avc444_tile_pdu(
+                            Codec1Type::Avc444v2,
+                            surface,
+                            &tile,
+                        )));
+                }
             }
         }
 
@@ -1605,19 +2490,51 @@ impl GraphicsPipelineServer {
         let mode = self.compression_mode;
         let pdus: Vec<_> = self.output_queue.drain(..).collect();
 
-        pdus.into_iter()
+        // D2: ZGFX compression timing. drain_output runs synchronously on the
+        // event-dispatch thread and is held under both `this.lock()` and the
+        // SharedWriter lock — so any slowness here blocks both inbound PDU
+        // processing AND outbound writes. Sum per-PDU compress times; log
+        // INFO if the batch exceeded a budget so operators can see when ZGFX
+        // is the limiter on a slow VM.
+        let drain_start = Instant::now();
+        let mut total_uncompressed: usize = 0;
+        let mut total_compressed: usize = 0;
+        let pdu_count = pdus.len();
+
+        let messages: Vec<DvcMessage> = pdus
+            .into_iter()
             .map(|pdu| {
                 let pdu_name = pdu.name();
                 let pdu_size = pdu.size();
                 let mut pdu_bytes = vec![0u8; pdu_size];
                 let mut cursor = WriteCursor::new(&mut pdu_bytes);
                 pdu.encode(&mut cursor).expect("GfxPdu encoding should not fail");
+                total_uncompressed += pdu_size;
+
+                // H.264 bitstreams are already entropy coded, so searching them
+                // for matches costs CPU on the caller's send path and almost never
+                // shrinks them. Send them uncompressed, but still record their
+                // bytes in the history (MS-RDPEGFX 3.1.9.1.2).
+                let is_h264 = matches!(
+                    &pdu,
+                    GfxPdu::WireToSurface1(wire)
+                        if matches!(wire.codec_id, Codec1Type::Avc420 | Codec1Type::Avc444 | Codec1Type::Avc444v2)
+                );
 
                 let wrapped = match mode {
                     CompressionMode::Never => wrap_uncompressed(&pdu_bytes),
-                    _ => compress_and_wrap_egfx(&pdu_bytes, &mut self.zgfx_compressor, mode)
-                        .unwrap_or_else(|_| wrap_uncompressed(&pdu_bytes)),
+                    CompressionMode::Auto | CompressionMode::Always if is_h264 => {
+                        wrap_uncompressed_recorded(&pdu_bytes, &mut self.zgfx_compressor)
+                    }
+                    CompressionMode::Auto | CompressionMode::Always => {
+                        compress_and_wrap_egfx(&pdu_bytes, &mut self.zgfx_compressor, mode)
+                            // None of the compressor's encoders returns an error today. If one ever did, the
+                            // tokens before it would already be in the history, so recording this PDU again
+                            // here would not bring the peer back in step. Both histories would need a reset.
+                            .unwrap_or_else(|_| wrap_uncompressed(&pdu_bytes))
+                    }
                 };
+                total_compressed += wrapped.len();
                 trace!(pdu_name, pdu_size, wrapped = wrapped.len(), mode = ?mode, "ZGFX output");
 
                 Box::new(ZgfxWrappedBytes {
@@ -1625,7 +2542,34 @@ impl GraphicsPipelineServer {
                     pdu_name,
                 }) as DvcMessage
             })
-            .collect()
+            .collect();
+
+        // D2: log batch timing. INFO threshold at 10ms — anything above is
+        // significant for the per-frame budget. Always log at DEBUG so the
+        // ZGFX ratio is visible during normal debug sessions.
+        let elapsed = drain_start.elapsed();
+        if elapsed >= core::time::Duration::from_millis(10) {
+            tracing::info!(
+                pdu_count,
+                total_uncompressed,
+                total_compressed,
+                ratio = format!("{:.2}", total_uncompressed as f32 / total_compressed.max(1) as f32),
+                drain_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                mode = ?mode,
+                "EGFX drain_output (ZGFX compress) slow"
+            );
+        } else if pdu_count > 0 {
+            tracing::debug!(
+                pdu_count,
+                total_uncompressed,
+                total_compressed,
+                ratio = format!("{:.2}", total_uncompressed as f32 / total_compressed.max(1) as f32),
+                drain_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+                mode = ?mode,
+                "EGFX drain_output"
+            );
+        }
+        messages
     }
 
     /// Check if there are pending PDUs to send
@@ -1639,6 +2583,31 @@ impl GraphicsPipelineServer {
     // ========================================================================
 
     fn handle_capabilities_advertise(&mut self, pdu: CapabilitiesAdvertisePdu) {
+        // Detect mid-session re-advertise. mstsc (and likely other clients)
+        // emits a fresh CapsAdvertise as a decoder-recovery sequence under
+        // load, typically when its EGFX decoder loses sync after a long
+        // P-slice chain. Before sending CapsAdvertise the client has cleared
+        // its surface/frame/cache state, so the server must mirror that
+        // silently (no DeleteSurface PDUs, the client doesn't have those
+        // surfaces anymore and treats a stray DeleteSurface as a protocol
+        // violation, leading to TCP RST within milliseconds).
+        //
+        // Observed: macOS Windows App and mstsc on Windows 11 both initiate
+        // this sequence. MS-RDPEGFX does not document the recovery flow
+        // explicitly, but the empirical pattern is CapsAdvertise ->
+        // CacheImportOffer -> expect server to emit CapsConfirm +
+        // ResetGraphics + CreateSurface(id=0) + MapSurfaceToOutput + IDR.
+        let is_readvertise = self.state == ServerState::Ready;
+        if is_readvertise {
+            debug!(
+                "EGFX: mid-session CapsAdvertise observed, silently clearing surface and frame \
+                 state for re-initialization (no DeleteSurface PDU emitted, surface ID counter reset)"
+            );
+            self.surfaces.reset_for_reinit();
+            self.frames.clear_pending_frames();
+            self.reset_graphics_sent = false;
+        }
+
         self.handler.capabilities_advertise(&pdu);
         let server_caps = self.handler.preferred_capabilities();
 
@@ -1661,14 +2630,16 @@ impl GraphicsPipelineServer {
         // When no version overlaps with server preferences, confirm the client's
         // highest-priority capability to avoid confirming a version the client
         // did not advertise.
-        let negotiated = negotiate_capabilities(&client_caps, &server_caps).unwrap_or_else(|| {
-            warn!("No capability match with server preferences, selecting client's highest version");
-            let mut client_sorted = client_caps.clone();
-            client_sorted.sort_by_key(|cap| core::cmp::Reverse(capability_priority(cap)));
-            client_sorted.into_iter().next().unwrap_or(CapabilitySet::V8 {
-                flags: CapabilitiesV8Flags::empty(),
-            })
-        });
+        let negotiated = sanitize_capabilities_for_confirm(
+            negotiate_capabilities(&client_caps, &server_caps).unwrap_or_else(|| {
+                warn!("No capability match with server preferences, selecting client's highest version");
+                let mut client_sorted = client_caps.clone();
+                client_sorted.sort_by_key(|cap| core::cmp::Reverse(capability_priority(cap)));
+                client_sorted.into_iter().next().unwrap_or(CapabilitySet::V8 {
+                    flags: CapabilitiesV8Flags::empty(),
+                })
+            }),
+        );
 
         self.codec_caps = CodecCapabilities::from_capability_set(&negotiated);
         self.state = ServerState::Ready;
@@ -1684,14 +2655,44 @@ impl GraphicsPipelineServer {
 
     fn handle_frame_acknowledge(&mut self, pdu: FrameAcknowledgePdu) {
         let queue_depth = pdu.queue_depth.to_u32();
-
-        if let Some(info) = self.frames.acknowledge(pdu.frame_id, queue_depth) {
-            let rtt = info.sent_at.elapsed();
-            self.qoe.record_rtt(rtt);
-            self.qoe.record_frame_ack(info.size_bytes);
-            trace!(frame_id = pdu.frame_id, latency = ?rtt);
+        let suspended = queue_depth == SUSPEND_FRAME_ACK_QUEUE_DEPTH;
+        if !self.is_ready() && !suspended {
+            debug!(
+                frame_id = pdu.frame_id,
+                "Ignoring frame acknowledgement outside active EGFX generation"
+            );
+            return;
         }
 
+        let Some(info) = self.frames.acknowledge(pdu.frame_id, queue_depth) else {
+            let accepted = if suspended {
+                self.frames.suspend_from_untracked_ack(pdu.frame_id)
+            } else {
+                self.frames.resume_from_untracked_ack(pdu.frame_id, queue_depth)
+            };
+            if accepted {
+                self.handler
+                    .on_frame_ack(pdu.frame_id, queue_depth, pdu.total_frames_decoded);
+                return;
+            }
+            debug!(
+                frame_id = pdu.frame_id,
+                queue_depth, "Ignoring unknown or stale frame acknowledgement"
+            );
+            return;
+        };
+
+        let rtt = info.sent_at.elapsed();
+        self.qoe.record_rtt(rtt);
+        self.qoe.record_frame_ack(info.size_bytes);
+        debug!(
+            frame_id = pdu.frame_id,
+            latency_us = u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX),
+            queue_depth,
+            suspended,
+            in_flight_after = self.frames.in_flight(),
+            "EGFX FrameAcknowledge received"
+        );
         self.handler
             .on_frame_ack(pdu.frame_id, queue_depth, pdu.total_frames_decoded);
     }
@@ -1724,6 +2725,9 @@ impl DvcProcessor for GraphicsPipelineServer {
     }
 
     fn start(&mut self, channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+        // The core capability clamp is applied before the dynamic channel opens,
+        // so preserve it here. close() already clears the prior generation.
+        self.state = ServerState::WaitingForCapabilities;
         self.channel_id = Some(channel_id);
         debug!(channel_id, "EGFX channel started");
         Ok(vec![])
@@ -1731,13 +2735,29 @@ impl DvcProcessor for GraphicsPipelineServer {
 
     fn close(&mut self, _channel_id: u32) {
         debug!("EGFX channel closed");
+        self.reset_channel_state();
         self.state = ServerState::Closed;
-        self.reset_graphics_sent = false;
         self.handler.on_close();
     }
 
     fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
         let pdu = decode(payload).map_err(|e| decode_err!(e))?;
+
+        // Single-source dispatch log. DEBUG level so operators see every
+        // client→server EGFX PDU at default debug builds without having to
+        // enable TRACE (which floods on the encode side).
+        // PROTOCOL COMPLIANCE: client-bound PDU types per MS-RDPEGFX 2.2:
+        // CapabilitiesAdvertise (2.2.1.1), FrameAcknowledge (2.2.4.3),
+        // QoeFrameAcknowledge (2.2.4.4), CacheImportOffer (2.2.2.16).
+        // Anything else lands in the `_` arm as `warn!("Unhandled")`.
+        let pdu_kind = match &pdu {
+            GfxPdu::CapabilitiesAdvertise(_) => "CapabilitiesAdvertise",
+            GfxPdu::FrameAcknowledge(_) => "FrameAcknowledge",
+            GfxPdu::QoeFrameAcknowledge(_) => "QoeFrameAcknowledge",
+            GfxPdu::CacheImportOffer(_) => "CacheImportOffer",
+            _ => "other",
+        };
+        debug!(pdu_kind, payload_len = payload.len(), "EGFX DVC PDU received");
 
         match pdu {
             GfxPdu::CapabilitiesAdvertise(pdu) => {
@@ -1780,4 +2800,275 @@ fn encode_avc444_bitmap_stream(stream: &Avc444BitmapStream<'_>) -> Vec<u8> {
         .expect("encode_avc444_bitmap_stream: encoding failed");
 
     buf
+}
+
+#[cfg(test)]
+mod capability_negotiation_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_client_avc_disabled_constraint() {
+        let cases = [
+            (
+                CapabilitySet::V10 {
+                    flags: CapabilitiesV10Flags::AVC_DISABLED | CapabilitiesV10Flags::SMALL_CACHE,
+                },
+                CapabilitySet::V10 {
+                    flags: CapabilitiesV10Flags::SMALL_CACHE,
+                },
+            ),
+            (
+                CapabilitySet::V10_2 {
+                    flags: CapabilitiesV10Flags::AVC_DISABLED | CapabilitiesV10Flags::SMALL_CACHE,
+                },
+                CapabilitySet::V10_2 {
+                    flags: CapabilitiesV10Flags::SMALL_CACHE,
+                },
+            ),
+            (
+                CapabilitySet::V10_3 {
+                    flags: CapabilitiesV103Flags::AVC_DISABLED,
+                },
+                CapabilitySet::V10_3 {
+                    flags: CapabilitiesV103Flags::empty(),
+                },
+            ),
+            (
+                CapabilitySet::V10_4 {
+                    flags: CapabilitiesV104Flags::AVC_DISABLED | CapabilitiesV104Flags::SMALL_CACHE,
+                },
+                CapabilitySet::V10_4 {
+                    flags: CapabilitiesV104Flags::SMALL_CACHE,
+                },
+            ),
+            (
+                CapabilitySet::V10_5 {
+                    flags: CapabilitiesV104Flags::AVC_DISABLED | CapabilitiesV104Flags::SMALL_CACHE,
+                },
+                CapabilitySet::V10_5 {
+                    flags: CapabilitiesV104Flags::SMALL_CACHE,
+                },
+            ),
+            (
+                CapabilitySet::V10_6 {
+                    flags: CapabilitiesV104Flags::AVC_DISABLED | CapabilitiesV104Flags::SMALL_CACHE,
+                },
+                CapabilitySet::V10_6 {
+                    flags: CapabilitiesV104Flags::SMALL_CACHE,
+                },
+            ),
+            (
+                CapabilitySet::V10_6Err {
+                    flags: CapabilitiesV104Flags::AVC_DISABLED | CapabilitiesV104Flags::SMALL_CACHE,
+                },
+                CapabilitySet::V10_6Err {
+                    flags: CapabilitiesV104Flags::SMALL_CACHE,
+                },
+            ),
+            (
+                CapabilitySet::V10_7 {
+                    flags: CapabilitiesV107Flags::AVC_DISABLED | CapabilitiesV107Flags::SMALL_CACHE,
+                },
+                CapabilitySet::V10_7 {
+                    flags: CapabilitiesV107Flags::SMALL_CACHE,
+                },
+            ),
+        ];
+
+        for (client, server) in cases {
+            assert_eq!(
+                negotiate_capabilities(core::slice::from_ref(&client), &[server]),
+                Some(client)
+            );
+        }
+    }
+
+    #[test]
+    fn removes_avc_thin_client_from_malformed_avc_disabled_capabilities() {
+        let cases = [
+            (
+                CapabilitySet::V10_3 {
+                    flags: CapabilitiesV103Flags::AVC_DISABLED | CapabilitiesV103Flags::AVC_THIN_CLIENT,
+                },
+                CapabilitySet::V10_3 {
+                    flags: CapabilitiesV103Flags::AVC_THIN_CLIENT,
+                },
+                CapabilitySet::V10_3 {
+                    flags: CapabilitiesV103Flags::AVC_DISABLED,
+                },
+            ),
+            (
+                CapabilitySet::V10_4 {
+                    flags: CapabilitiesV104Flags::AVC_DISABLED
+                        | CapabilitiesV104Flags::AVC_THIN_CLIENT
+                        | CapabilitiesV104Flags::SMALL_CACHE,
+                },
+                CapabilitySet::V10_4 {
+                    flags: CapabilitiesV104Flags::AVC_THIN_CLIENT | CapabilitiesV104Flags::SMALL_CACHE,
+                },
+                CapabilitySet::V10_4 {
+                    flags: CapabilitiesV104Flags::AVC_DISABLED | CapabilitiesV104Flags::SMALL_CACHE,
+                },
+            ),
+            (
+                CapabilitySet::V10_5 {
+                    flags: CapabilitiesV104Flags::AVC_DISABLED
+                        | CapabilitiesV104Flags::AVC_THIN_CLIENT
+                        | CapabilitiesV104Flags::SMALL_CACHE,
+                },
+                CapabilitySet::V10_5 {
+                    flags: CapabilitiesV104Flags::AVC_THIN_CLIENT | CapabilitiesV104Flags::SMALL_CACHE,
+                },
+                CapabilitySet::V10_5 {
+                    flags: CapabilitiesV104Flags::AVC_DISABLED | CapabilitiesV104Flags::SMALL_CACHE,
+                },
+            ),
+            (
+                CapabilitySet::V10_6 {
+                    flags: CapabilitiesV104Flags::AVC_DISABLED
+                        | CapabilitiesV104Flags::AVC_THIN_CLIENT
+                        | CapabilitiesV104Flags::SMALL_CACHE,
+                },
+                CapabilitySet::V10_6 {
+                    flags: CapabilitiesV104Flags::AVC_THIN_CLIENT | CapabilitiesV104Flags::SMALL_CACHE,
+                },
+                CapabilitySet::V10_6 {
+                    flags: CapabilitiesV104Flags::AVC_DISABLED | CapabilitiesV104Flags::SMALL_CACHE,
+                },
+            ),
+            (
+                CapabilitySet::V10_6Err {
+                    flags: CapabilitiesV104Flags::AVC_DISABLED
+                        | CapabilitiesV104Flags::AVC_THIN_CLIENT
+                        | CapabilitiesV104Flags::SMALL_CACHE,
+                },
+                CapabilitySet::V10_6Err {
+                    flags: CapabilitiesV104Flags::AVC_THIN_CLIENT | CapabilitiesV104Flags::SMALL_CACHE,
+                },
+                CapabilitySet::V10_6Err {
+                    flags: CapabilitiesV104Flags::AVC_DISABLED | CapabilitiesV104Flags::SMALL_CACHE,
+                },
+            ),
+            (
+                CapabilitySet::V10_7 {
+                    flags: CapabilitiesV107Flags::AVC_DISABLED
+                        | CapabilitiesV107Flags::AVC_THIN_CLIENT
+                        | CapabilitiesV107Flags::SMALL_CACHE,
+                },
+                CapabilitySet::V10_7 {
+                    flags: CapabilitiesV107Flags::AVC_THIN_CLIENT | CapabilitiesV107Flags::SMALL_CACHE,
+                },
+                CapabilitySet::V10_7 {
+                    flags: CapabilitiesV107Flags::AVC_DISABLED | CapabilitiesV107Flags::SMALL_CACHE,
+                },
+            ),
+        ];
+
+        for (client, server, expected) in cases {
+            assert_eq!(sanitize_capabilities_for_confirm(client.clone()), expected);
+            assert_eq!(negotiate_capabilities(&[client], &[server]), Some(expected));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_suspend_ack_is_honoured_without_a_tracked_sample_or_ready_state() {
+        let mut server = GraphicsPipelineServer::new(Box::new(DefaultsHandler));
+        let frame_id = server.frames.begin_frame(GraphicsPipelineServer::make_timestamp(0));
+        server.frames.acknowledge(frame_id, 0).unwrap();
+        server.state = ServerState::Resizing;
+        server.handle_frame_acknowledge(FrameAcknowledgePdu {
+            frame_id,
+            queue_depth: crate::pdu::QueueDepth::Suspend,
+            total_frames_decoded: 1,
+        });
+        assert!(server.frames.is_ack_suspended());
+        assert_eq!(server.frames.in_flight(), 0);
+        assert!(!server.frames.should_backpressure());
+        assert_eq!(
+            server.frames.total_acked(),
+            1,
+            "suspension must not fabricate another RTT/ACK sample"
+        );
+    }
+
+    #[test]
+    fn suspension_resume_eligibility_handles_wrapping_ids_and_repeated_suspend() {
+        let mut tracker = FrameTracker::new();
+        tracker.next_frame_id = u32::MAX;
+        tracker.generation_first_frame_id = u32::MAX;
+        let suspended_frame = tracker.begin_frame(GraphicsPipelineServer::make_timestamp(0));
+        tracker
+            .acknowledge(suspended_frame, SUSPEND_FRAME_ACK_QUEUE_DEPTH)
+            .unwrap();
+        let during_pause = tracker.begin_frame(GraphicsPipelineServer::make_timestamp(0));
+        assert_eq!(during_pause, 0);
+        assert!(tracker.suspend_from_untracked_ack(suspended_frame));
+        assert!(tracker.resume_from_untracked_ack(during_pause, 0));
+        assert!(!tracker.is_ack_suspended());
+        assert!(!tracker.resume_from_untracked_ack(during_pause, 99));
+        tracker.clear();
+        assert!(!tracker.suspend_from_untracked_ack(suspended_frame));
+    }
+
+    struct DefaultsHandler;
+
+    impl GraphicsPipelineHandler for DefaultsHandler {
+        fn capabilities_advertise(&mut self, _pdu: &CapabilitiesAdvertisePdu) {}
+        fn on_ready(&mut self, _negotiated: &CapabilitySet) {}
+    }
+
+    /// Negotiation matches exact versions, so the default ladder must declare
+    /// every version this build can interpret: a client advertising only a
+    /// mid-tier V10 variant previously fell through every rung and lost the
+    /// channel.
+    #[test]
+    fn mid_tier_only_client_negotiates_its_version() {
+        let server_caps = DefaultsHandler.preferred_capabilities();
+        let client_caps = [CapabilitySet::V10_6 {
+            flags: CapabilitiesV104Flags::empty(),
+        }];
+
+        let negotiated = negotiate_capabilities(&client_caps, &server_caps).expect("V10.6-only client negotiates");
+
+        assert!(matches!(negotiated, CapabilitySet::V10_6 { .. }));
+        assert!(CodecCapabilities::from_capability_set(&negotiated).avc444);
+    }
+
+    #[test]
+    fn higher_mid_tier_wins_when_client_advertises_several() {
+        let server_caps = DefaultsHandler.preferred_capabilities();
+        let client_caps = [
+            CapabilitySet::V10_3 {
+                flags: CapabilitiesV103Flags::empty(),
+            },
+            CapabilitySet::V10_6 {
+                flags: CapabilitiesV104Flags::empty(),
+            },
+        ];
+
+        let negotiated = negotiate_capabilities(&client_caps, &server_caps).expect("negotiates");
+
+        assert!(matches!(negotiated, CapabilitySet::V10_6 { .. }));
+    }
+
+    #[test]
+    fn every_declared_version_negotiates_as_sole_client_cap() {
+        let server_caps = DefaultsHandler.preferred_capabilities();
+
+        for cap in &server_caps {
+            let client_caps = [cap.clone()];
+            let negotiated = negotiate_capabilities(&client_caps, &server_caps)
+                .unwrap_or_else(|| panic!("ladder entry failed to negotiate: {cap:?}"));
+            assert_eq!(
+                core::mem::discriminant(&negotiated),
+                core::mem::discriminant(cap),
+                "negotiated a different version than the sole client cap"
+            );
+        }
+    }
 }

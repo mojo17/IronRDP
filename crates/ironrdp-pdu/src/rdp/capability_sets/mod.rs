@@ -20,9 +20,11 @@ mod multifragment_update;
 mod offscreen_bitmap_cache;
 mod order;
 mod pointer;
+mod rail;
 mod sound;
 mod surface_commands;
 mod virtual_channel;
+mod window_list;
 
 pub use self::bitmap::{Bitmap, BitmapDrawingFlags};
 pub use self::bitmap_cache::{
@@ -43,9 +45,11 @@ pub use self::multifragment_update::MultifragmentUpdate;
 pub use self::offscreen_bitmap_cache::OffscreenBitmapCache;
 pub use self::order::{Order, OrderFlags, OrderSupportExFlags, OrderSupportIndex};
 pub use self::pointer::Pointer;
+pub use self::rail::{Rail, RailSupportLevel};
 pub use self::sound::{Sound, SoundFlags};
 pub use self::surface_commands::{CmdFlags, SurfaceCommands};
 pub use self::virtual_channel::{VirtualChannel, VirtualChannelFlags};
+pub use self::window_list::{WindowList, WindowSupportLevel};
 
 pub const SERVER_CHANNEL_ID: u16 = 0x03ea;
 
@@ -182,12 +186,11 @@ impl Encode for DemandActive {
 
         dst.write_u16(cast_length!(
             "sourceDescLen",
-            self.source_descriptor.len() + NULL_TERMINATOR.len()
-        )?);
-        dst.write_u16(cast_length!("combinedLen", combined_length)?);
+            self.source_descriptor.len() + NULL_TERMINATOR.len(), in: dst)?);
+        dst.write_u16(cast_length!("combinedLen", combined_length, in: dst)?);
         dst.write_slice(self.source_descriptor.as_ref());
         dst.write_slice(NULL_TERMINATOR.as_bytes());
-        dst.write_u16(cast_length!("len", self.capability_sets.len())?);
+        dst.write_u16(cast_length!("len", self.capability_sets.len(), in: dst)?);
         write_padding!(dst, 2);
 
         for capability_set in self.capability_sets.iter() {
@@ -277,8 +280,8 @@ pub enum CapabilitySet {
     ColorCache(Vec<u8>),
     DrawNineGridCache(Vec<u8>),
     DrawGdiPlus(Vec<u8>),
-    Rail(Vec<u8>),
-    WindowList(Vec<u8>),
+    Rail(Rail),
+    WindowList(WindowList),
     BitmapCacheV3(Vec<u8>),
 }
 
@@ -297,132 +300,131 @@ impl Encode for CapabilitySet {
                 dst.write_u16(CapabilitySetType::General.as_u16());
                 dst.write_u16(cast_length!(
                     "len",
-                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE
-                )?);
+                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE, in: dst)?);
                 capset.encode(dst)?;
             }
             CapabilitySet::Bitmap(capset) => {
                 dst.write_u16(CapabilitySetType::Bitmap.as_u16());
                 dst.write_u16(cast_length!(
                     "len",
-                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE
-                )?);
+                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE, in: dst)?);
                 capset.encode(dst)?;
             }
             CapabilitySet::Order(capset) => {
                 dst.write_u16(CapabilitySetType::Order.as_u16());
                 dst.write_u16(cast_length!(
                     "len",
-                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE
-                )?);
+                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE, in: dst)?);
                 capset.encode(dst)?;
             }
             CapabilitySet::BitmapCache(capset) => {
                 dst.write_u16(CapabilitySetType::BitmapCache.as_u16());
                 dst.write_u16(cast_length!(
                     "len",
-                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE
-                )?);
+                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE, in: dst)?);
                 capset.encode(dst)?;
             }
             CapabilitySet::BitmapCacheRev2(capset) => {
                 dst.write_u16(CapabilitySetType::BitmapCacheRev2.as_u16());
                 dst.write_u16(cast_length!(
                     "len",
-                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE
-                )?);
+                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE, in: dst)?);
                 capset.encode(dst)?;
             }
             CapabilitySet::Pointer(capset) => {
                 dst.write_u16(CapabilitySetType::Pointer.as_u16());
                 dst.write_u16(cast_length!(
                     "len",
-                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE
-                )?);
+                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE, in: dst)?);
                 capset.encode(dst)?;
             }
             CapabilitySet::Sound(capset) => {
                 dst.write_u16(CapabilitySetType::Sound.as_u16());
                 dst.write_u16(cast_length!(
                     "len",
-                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE
-                )?);
+                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE, in: dst)?);
                 capset.encode(dst)?;
             }
             CapabilitySet::Input(capset) => {
                 dst.write_u16(CapabilitySetType::Input.as_u16());
                 dst.write_u16(cast_length!(
                     "len",
-                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE
-                )?);
+                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE, in: dst)?);
                 capset.encode(dst)?;
             }
             CapabilitySet::Brush(capset) => {
                 dst.write_u16(CapabilitySetType::Brush.as_u16());
                 dst.write_u16(cast_length!(
                     "len",
-                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE
-                )?);
+                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE, in: dst)?);
                 capset.encode(dst)?;
             }
             CapabilitySet::GlyphCache(capset) => {
                 dst.write_u16(CapabilitySetType::GlyphCache.as_u16());
                 dst.write_u16(cast_length!(
                     "len",
-                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE
-                )?);
+                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE, in: dst)?);
                 capset.encode(dst)?;
             }
             CapabilitySet::OffscreenBitmapCache(capset) => {
                 dst.write_u16(CapabilitySetType::OffscreenBitmapCache.as_u16());
                 dst.write_u16(cast_length!(
                     "len",
-                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE
-                )?);
+                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE, in: dst)?);
                 capset.encode(dst)?;
             }
             CapabilitySet::VirtualChannel(capset) => {
                 dst.write_u16(CapabilitySetType::VirtualChannel.as_u16());
                 dst.write_u16(cast_length!(
                     "len",
-                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE
-                )?);
+                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE, in: dst)?);
                 capset.encode(dst)?;
             }
             CapabilitySet::SurfaceCommands(capset) => {
                 dst.write_u16(CapabilitySetType::SurfaceCommands.as_u16());
                 dst.write_u16(cast_length!(
                     "len",
-                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE
-                )?);
+                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE, in: dst)?);
                 capset.encode(dst)?;
             }
             CapabilitySet::BitmapCodecs(capset) => {
                 dst.write_u16(CapabilitySetType::BitmapCodecs.as_u16());
                 dst.write_u16(cast_length!(
                     "len",
-                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE
-                )?);
+                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE, in: dst)?);
                 capset.encode(dst)?;
             }
             CapabilitySet::MultiFragmentUpdate(capset) => {
                 dst.write_u16(CapabilitySetType::MultiFragmentUpdate.as_u16());
                 dst.write_u16(cast_length!(
                     "len",
-                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE
-                )?);
+                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE, in: dst)?);
                 capset.encode(dst)?;
             }
             CapabilitySet::LargePointer(capset) => {
                 dst.write_u16(CapabilitySetType::LargePointer.as_u16());
                 dst.write_u16(cast_length!(
                     "len",
-                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE
-                )?);
+                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE, in: dst)?);
                 capset.encode(dst)?;
             }
             CapabilitySet::FrameAcknowledge(capset) => {
                 dst.write_u16(CapabilitySetType::FrameAcknowledge.as_u16());
+                dst.write_u16(cast_length!(
+                    "len",
+                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE, in: dst)?);
+                capset.encode(dst)?;
+            }
+            CapabilitySet::Rail(capset) => {
+                dst.write_u16(CapabilitySetType::Rail.as_u16());
+                dst.write_u16(cast_length!(
+                    "len",
+                    capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE
+                )?);
+                capset.encode(dst)?;
+            }
+            CapabilitySet::WindowList(capset) => {
+                dst.write_u16(CapabilitySetType::WindowList.as_u16());
                 dst.write_u16(cast_length!(
                     "len",
                     capset.size() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE
@@ -442,17 +444,43 @@ impl Encode for CapabilitySet {
                     CapabilitySet::ColorCache(buffer) => (CapabilitySetType::ColorCache, buffer),
                     CapabilitySet::DrawNineGridCache(buffer) => (CapabilitySetType::DrawNineGridCache, buffer),
                     CapabilitySet::DrawGdiPlus(buffer) => (CapabilitySetType::DrawGdiPlus, buffer),
-                    CapabilitySet::Rail(buffer) => (CapabilitySetType::Rail, buffer),
-                    CapabilitySet::WindowList(buffer) => (CapabilitySetType::WindowList, buffer),
                     CapabilitySet::BitmapCacheV3(buffer) => (CapabilitySetType::BitmapCacheV3CodecID, buffer),
-                    _ => unreachable!(),
+                    // Structured variants are routed through the outer match's
+                    // specific arms above this block and cannot reach this
+                    // inner match. Listing them explicitly (instead of using
+                    // `_ =>`) makes a future addition to `CapabilitySet` a
+                    // compile error here until the new variant is routed in
+                    // this `Encode` impl. PR #1313 (BitmapCacheV3 encoder
+                    // `unreachable!()` reached on decoder-accepted input)
+                    // demonstrated why a runtime catch-all is the wrong shape
+                    // for this match.
+                    CapabilitySet::General(_)
+                    | CapabilitySet::Bitmap(_)
+                    | CapabilitySet::Order(_)
+                    | CapabilitySet::BitmapCache(_)
+                    | CapabilitySet::BitmapCacheRev2(_)
+                    | CapabilitySet::Pointer(_)
+                    | CapabilitySet::Sound(_)
+                    | CapabilitySet::Input(_)
+                    | CapabilitySet::Brush(_)
+                    | CapabilitySet::GlyphCache(_)
+                    | CapabilitySet::OffscreenBitmapCache(_)
+                    | CapabilitySet::VirtualChannel(_)
+                    | CapabilitySet::MultiFragmentUpdate(_)
+                    | CapabilitySet::LargePointer(_)
+                    | CapabilitySet::SurfaceCommands(_)
+                    | CapabilitySet::BitmapCodecs(_)
+                    | CapabilitySet::FrameAcknowledge(_)
+                    | CapabilitySet::Rail(_)
+                    | CapabilitySet::WindowList(_) => {
+                        unreachable!("structured variant routed to raw-buffer encoder arm")
+                    }
                 };
 
                 dst.write_u16(capability_set_type.as_u16());
                 dst.write_u16(cast_length!(
                     "len",
-                    capability_set_buffer.len() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE
-                )?);
+                    capability_set_buffer.len() + CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE, in: dst)?);
                 dst.write_slice(capability_set_buffer);
             }
         };
@@ -483,6 +511,8 @@ impl Encode for CapabilitySet {
                 CapabilitySet::MultiFragmentUpdate(capset) => capset.size(),
                 CapabilitySet::LargePointer(capset) => capset.size(),
                 CapabilitySet::FrameAcknowledge(capset) => capset.size(),
+                CapabilitySet::Rail(capset) => capset.size(),
+                CapabilitySet::WindowList(capset) => capset.size(),
                 CapabilitySet::Control(buffer)
                 | CapabilitySet::WindowActivation(buffer)
                 | CapabilitySet::Share(buffer)
@@ -492,8 +522,6 @@ impl Encode for CapabilitySet {
                 | CapabilitySet::ColorCache(buffer)
                 | CapabilitySet::DrawNineGridCache(buffer)
                 | CapabilitySet::DrawGdiPlus(buffer)
-                | CapabilitySet::Rail(buffer)
-                | CapabilitySet::WindowList(buffer)
                 | CapabilitySet::BitmapCacheV3(buffer) => buffer.len(),
             }
     }
@@ -505,16 +533,14 @@ impl<'de> Decode<'de> for CapabilitySet {
 
         let capability_set_type_raw = src.read_u16();
         let capability_set_type = CapabilitySetType::from_u16(capability_set_type_raw).ok_or_else(|| {
-            unsupported_value_err!(
-                "capabilitySetType",
-                format!("invalid capability set type: {}", capability_set_type_raw)
-            )
+            unsupported_value_err!( "capabilitySetType",
+                format!("invalid capability set type: {}", capability_set_type_raw), in: src)
         })?;
 
         let length = usize::from(src.read_u16());
 
         if length < CAPABILITY_SET_TYPE_FIELD_SIZE + CAPABILITY_SET_LENGTH_FIELD_SIZE {
-            return Err(invalid_field_err!("len", "invalid capability set length"));
+            return Err(invalid_field_err!("len", "invalid capability set length", in: src));
         }
 
         let buffer_length = length - CAPABILITY_SET_TYPE_FIELD_SIZE - CAPABILITY_SET_LENGTH_FIELD_SIZE;
@@ -556,8 +582,20 @@ impl<'de> Decode<'de> for CapabilitySet {
             CapabilitySetType::ColorCache => Ok(CapabilitySet::ColorCache(capability_set_buffer.into())),
             CapabilitySetType::DrawNineGridCache => Ok(CapabilitySet::DrawNineGridCache(capability_set_buffer.into())),
             CapabilitySetType::DrawGdiPlus => Ok(CapabilitySet::DrawGdiPlus(capability_set_buffer.into())),
-            CapabilitySetType::Rail => Ok(CapabilitySet::Rail(capability_set_buffer.into())),
-            CapabilitySetType::WindowList => Ok(CapabilitySet::WindowList(capability_set_buffer.into())),
+            CapabilitySetType::Rail => {
+                if buffer_length != Rail::FIXED_PART_SIZE {
+                    return Err(invalid_field_err!("len", "invalid RAIL capability set length"));
+                }
+
+                Ok(CapabilitySet::Rail(decode(capability_set_buffer)?))
+            }
+            CapabilitySetType::WindowList => {
+                if buffer_length != WindowList::FIXED_PART_SIZE {
+                    return Err(invalid_field_err!("len", "invalid window list capability set length"));
+                }
+
+                Ok(CapabilitySet::WindowList(decode(capability_set_buffer)?))
+            }
             CapabilitySetType::FrameAcknowledge => Ok(CapabilitySet::FrameAcknowledge(decode(capability_set_buffer)?)),
             CapabilitySetType::BitmapCacheV3CodecID => Ok(CapabilitySet::BitmapCacheV3(capability_set_buffer.into())),
         }

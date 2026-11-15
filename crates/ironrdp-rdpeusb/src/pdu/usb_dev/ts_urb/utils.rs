@@ -16,7 +16,7 @@ use crate::pdu::{
         TsUrbBulkOrInterruptTransfer, TsUrbControlDescRequest, TsUrbControlFeatRequest, TsUrbControlGetConfigRequest,
         TsUrbControlGetInterfaceRequest, TsUrbControlGetStatusRequest, TsUrbControlTransfer, TsUrbControlTransferEx,
         TsUrbControlVendorClassRequest, TsUrbGetCurrFrameNum, TsUrbIn, TsUrbIsochTransfer, TsUrbOsFeatDescRequest,
-        TsUrbOut, TsUrbPipeRequest, TsUrbSelectConfig, TsUrbSelectInterface,
+        TsUrbOutKind, TsUrbPipeRequest, TsUrbSelectConfig, TsUrbSelectInterface,
     },
 };
 
@@ -297,7 +297,7 @@ impl From<UrbFunction> for u16 {
 ///
 /// [1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpeusb/578da9ca-3116-4608-9737-1bf3df4de3d1
 #[doc(alias = "TS_URB_HEADER")]
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub struct TsUrbHeader {
     /// The size in bytes of the TS_URB structure.
     pub ts_urb_size: u16,
@@ -342,7 +342,7 @@ impl TsUrbHeader {
     pub(super) fn encode_with_size(&self, dst: &mut WriteCursor<'_>, ts_urb_size: usize) -> EncodeResult<()> {
         let ts_urb_size = ts_urb_size
             .try_into()
-            .map_err(|_| invalid_field_err!("TS_URB_HEADER::Size", "too large: exceeded 2-byte size field"))?;
+            .map_err(|_| invalid_field_err!("TS_URB_HEADER::Size", "too large: exceeded 2-byte size field", in: dst))?;
 
         Self {
             ts_urb_size,
@@ -382,7 +382,7 @@ impl Decode<'_> for TsUrbHeader {
         ensure_fixed_part_size!(in: src);
         let size = src.read_u16();
         if usize::from(size) < Self::FIXED_PART_SIZE {
-            return Err(invalid_field_err!("TS_URB_HEADER::Size", "is smaller than 8"));
+            return Err(invalid_field_err!("TS_URB_HEADER::Size", "is smaller than 8", in: src));
         }
 
         let func = UrbFunction::from(src.read_u16());
@@ -398,7 +398,7 @@ impl Decode<'_> for TsUrbHeader {
             return Err(invalid_field_err!(
                 "TS_URB_HEADER::NoAck",
                 "this bit can only be set when URB Function is an isochronous transfer"
-            ));
+            , in: src));
         }
 
         Ok(Self {
@@ -457,7 +457,7 @@ impl Decode<'_> for TsUsbdPipeInfo {
         ensure_fixed_part_size!(in: src);
 
         let max_packet_size = src.read_u16();
-        read_padding(src, 2);
+        read_padding!(src, 2);
         let max_transfer_size = src.read_u32();
         let pipe_flags = src.read_u32();
 
@@ -552,7 +552,8 @@ impl Decode<'_> for TsUsbdInterfaceInfo {
         let length @ 12.. = src.read_u16() else {
             return Err(invalid_field_err!(
                 "TS_USBD_INTERFACE_INFORMATION::Length",
-                "is less than min reqd value of 12"
+                "is less than min reqd value of 12",
+                in: src,
             ));
         };
 
@@ -569,7 +570,8 @@ impl Decode<'_> for TsUsbdInterfaceInfo {
         if number_of_pipes != number_of_pipes_expected.into() {
             return Err(invalid_field_err!(
                 "TS_USBD_INTERFACE_INFORMATION::NumberOfPipesExpected",
-                "is not equal to TS_USBD_INTERFACE_INFORMATION::NumberOfPipes"
+                "is not equal to TS_USBD_INTERFACE_INFORMATION::NumberOfPipes",
+                in: src,
             ));
         }
 
@@ -578,7 +580,8 @@ impl Decode<'_> for TsUsbdInterfaceInfo {
             let Some(length_suggested_size) = length_suggested_size else {
                 return Err(invalid_field_err!(
                     "TS_USBD_INTERFACE_INFORMATION::Length",
-                    "is too small"
+                    "is too small",
+                    in: src,
                 ));
             };
 
@@ -587,7 +590,8 @@ impl Decode<'_> for TsUsbdInterfaceInfo {
             {
                 return Err(invalid_field_err!(
                     "TS_USBD_INTERFACE_INFORMATION::NumberOfPipes",
-                    "does not reflect number of pipes suggested by TS_USBD_INTERFACE_INFORMATION::Length"
+                    "does not reflect number of pipes suggested by TS_USBD_INTERFACE_INFORMATION::Length",
+                    in: src,
                 ));
             }
         }
@@ -617,6 +621,15 @@ pub struct UsbConfigDesc {
     pub configuration: u8,
     pub attributes: u8,
     pub max_power: u8,
+    /// The remainder of the configuration descriptor **after** the 9-byte header —
+    /// all interface / endpoint / class-specific descriptors, i.e. bytes
+    /// `9..total_length`.
+    ///
+    /// [MS-RDPEUSB] 2.2.9.2 requires the *full* configuration descriptor when
+    /// `ConfigurationDescriptorIsValid` is set; real Windows (mstsc) walks
+    /// `wTotalLength` bytes and rejects a header-only descriptor with `0x80070057`
+    /// (`E_INVALIDARG`). Empty means header-only.
+    pub trailing: Vec<u8>,
 }
 
 impl UsbConfigDesc {
@@ -632,7 +645,29 @@ impl UsbConfigDesc {
 
 impl Encode for UsbConfigDesc {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        ensure_fixed_part_size!(in: dst);
+        // Keep the header self-consistent with the bytes that actually follow:
+        // `bLength` is the 9-byte header length, and `wTotalLength` must span the
+        // header plus every trailing byte. Real Windows walks `wTotalLength` and
+        // rejects `URB_SELECT_CONFIGURATION` with `0x80070057` when it disagrees
+        // with the payload, so catch a mismatched value here instead of emitting a
+        // descriptor the peer will reject. (This also rejects a `trailing` too
+        // large for `wTotalLength` to address, since no u16 can then match.)
+        if usize::from(self.length) != Self::FIXED_PART_SIZE {
+            return Err(invalid_field_err!(
+                "USB_CONFIGURATION_DESCRIPTOR::bLength",
+                "must be the 9-byte configuration-descriptor header length",
+                in: dst
+            ));
+        }
+        if usize::from(self.total_length) != Self::FIXED_PART_SIZE + self.trailing.len() {
+            return Err(invalid_field_err!(
+                "USB_CONFIGURATION_DESCRIPTOR::wTotalLength",
+                "must equal the 9-byte header plus the trailing descriptor bytes",
+                in: dst
+            ));
+        }
+
+        ensure_size!(in: dst, size: self.size());
 
         dst.write_u8(self.length);
         dst.write_u8(self.descriptor_type);
@@ -642,6 +677,7 @@ impl Encode for UsbConfigDesc {
         dst.write_u8(self.configuration);
         dst.write_u8(self.attributes);
         dst.write_u8(self.max_power);
+        dst.write_slice(&self.trailing);
 
         Ok(())
     }
@@ -651,7 +687,7 @@ impl Encode for UsbConfigDesc {
     }
 
     fn size(&self) -> usize {
-        Self::FIXED_PART_SIZE
+        Self::FIXED_PART_SIZE + self.trailing.len()
     }
 }
 
@@ -667,6 +703,13 @@ impl Decode<'_> for UsbConfigDesc {
         let attributes = src.read_u8();
         let max_power = src.read_u8();
 
+        // The remaining interface/endpoint/class-specific descriptors, when the sender
+        // included the full configuration descriptor (bytes 9..total_length). Clamp to
+        // what is actually present so a header-only descriptor still decodes.
+        let trailing_len = usize::from(total_length).saturating_sub(Self::FIXED_PART_SIZE);
+        let trailing_len = trailing_len.min(src.len());
+        let trailing = src.read_slice(trailing_len).to_vec();
+
         Ok(Self {
             length,
             descriptor_type,
@@ -676,6 +719,7 @@ impl Decode<'_> for UsbConfigDesc {
             configuration,
             attributes,
             max_power,
+            trailing,
         })
     }
 }

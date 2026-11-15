@@ -97,3 +97,127 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "egfx_avc420_decode"
+path = "fuzz_targets/egfx_avc420_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "egfx_multi_frame"
+path = "fuzz_targets/egfx_multi_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rdpeudp_pdu_decode"
+path = "fuzz_targets/rdpeudp_pdu_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rdpemt_pdu_decode"
+path = "fuzz_targets/rdpemt_pdu_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rdpeudp_pdu_round_trip"
+path = "fuzz_targets/rdpeudp_pdu_round_trip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rdpemt_pdu_round_trip"
+path = "fuzz_targets/rdpemt_pdu_round_trip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rdpeudp_prefix_transform"
+path = "fuzz_targets/rdpeudp_prefix_transform.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rdpeudp_connection"
+path = "fuzz_targets/rdpeudp_connection.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rdpemt_tunnel"
+path = "fuzz_targets/rdpemt_tunnel.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rdpeudp_ack_vector"
+path = "fuzz_targets/rdpeudp_ack_vector.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rdpeusb_decode"
+path = "fuzz_targets/rdpeusb_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "message_decoding_invariants"
+path = "fuzz_targets/message_decoding_invariants.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "egfx_avc444_decode"
+path = "fuzz_targets/egfx_avc444_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bulk_rdp8"
+path = "fuzz_targets/bulk_rdp8.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "egfx_zgfx_decompress"
+path = "fuzz_targets/egfx_zgfx_decompress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "egfx_alpha_decode"
+path = "fuzz_targets/egfx_alpha_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "egfx_rfx_decode"
+path = "fuzz_targets/egfx_rfx_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "egfx_surface_state"
+path = "fuzz_targets/egfx_surface_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rdpsnd_codec_decode"
+path = "fuzz_targets/rdpsnd_codec_decode.rs"
+test = false
+doc = false
+bench = false

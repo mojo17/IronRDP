@@ -3,7 +3,7 @@ pub mod ffi {
     use core::fmt::Write as _;
 
     use anyhow::Context as _;
-    use diplomat_runtime::DiplomatWriteable;
+    use diplomat_runtime::DiplomatWrite;
 
     use crate::error::GenericError;
     use crate::error::ffi::IronRdpError;
@@ -19,7 +19,7 @@ pub mod ffi {
         /// * `x224_pdu` - The X.224 Connection Request PDU bytes
         /// * `destination` - The destination RDP server address (e.g., "10.10.0.3:3389")
         /// * `proxy_auth` - The JWT authentication token
-        /// * `pcb` - Optional preconnection blob (for Hyper-V VM connections, empty string if not needed)
+        /// * `pcb` - Optional legacy complete preconnection blob represented as a string
         pub fn new_request(
             x224_pdu: &[u8],
             destination: &str,
@@ -38,6 +38,27 @@ pub mod ffi {
             .map_err(GenericError)?;
 
             Ok(Box::new(RDCleanPathPdu(pdu)))
+        }
+
+        /// VMConnect request: proxy encodes the payload as PCB V2 and does TLS; client runs CredSSP then X.224.
+        pub fn new_vmconnect_request(
+            destination: &str,
+            proxy_auth: &str,
+            pcb_payload: &str,
+        ) -> Result<Box<RDCleanPathPdu>, Box<IronRdpError>> {
+            let pdu = ironrdp_rdcleanpath::RDCleanPathPdu::new_vmconnect_request(
+                destination.to_owned(),
+                proxy_auth.to_owned(),
+                pcb_payload.to_owned(),
+            )
+            .context("failed to create VMConnect RDCleanPath request")
+            .map_err(GenericError)?;
+            Ok(Box::new(RDCleanPathPdu(pdu)))
+        }
+
+        /// True when the PDU carries an X.224 payload.
+        pub fn has_x224(&self) -> bool {
+            self.0.x224_connection_pdu.is_some()
         }
 
         /// Decodes a RDCleanPath PDU from DER-encoded bytes
@@ -67,22 +88,25 @@ pub mod ffi {
         }
 
         /// Gets the type of this RDCleanPath PDU
+        #[diplomat::attr(auto, getter = "type")]
         pub fn get_type(&self) -> Result<RDCleanPathResultType, Box<IronRdpError>> {
             if self.0.destination.is_some() {
                 if self.0.proxy_auth.is_none() {
                     return Err(Self::missing_field("proxy_auth"));
                 }
 
-                if self.0.x224_connection_pdu.is_none() {
-                    return Err(Self::missing_field("x224_connection_pdu"));
+                if self.0.x224_connection_pdu.is_none()
+                    && self
+                        .0
+                        .preconnection_blob
+                        .as_deref()
+                        .is_none_or(|payload| payload.trim().is_empty())
+                {
+                    return Err(Self::missing_field("x224_connection_pdu or preconnection_blob"));
                 }
 
                 Ok(RDCleanPathResultType::Request)
             } else if self.0.server_addr.is_some() {
-                if self.0.x224_connection_pdu.is_none() {
-                    return Err(Self::missing_field("x224_connection_pdu"));
-                }
-
                 if self.0.server_cert_chain.is_none() {
                     return Err(Self::missing_field("server_cert_chain"));
                 }
@@ -104,6 +128,7 @@ pub mod ffi {
         }
 
         /// Gets the X.224 connection response bytes (for Response or NegotiationError variants)
+        #[diplomat::attr(auto, getter = "x224_response")]
         pub fn get_x224_response(&self) -> Result<Box<VecU8>, Box<IronRdpError>> {
             if self.0.server_addr.is_some() {
                 let x224 = self
@@ -127,21 +152,18 @@ pub mod ffi {
 
                     Ok(Box::new(VecU8(x224.as_bytes().to_vec())))
                 } else {
-                    Err(GenericError(anyhow::anyhow!("RDCleanPath variant does not contain X.224 response")).into())
+                    Err(GenericError(anyhow::anyhow!("message variant does not contain X.224 response")).into())
                 }
             } else {
-                Err(GenericError(anyhow::anyhow!("RDCleanPath variant does not contain X.224 response")).into())
+                Err(GenericError(anyhow::anyhow!("message variant does not contain X.224 response")).into())
             }
         }
 
         /// Gets the server certificate chain (for Response variant)
         /// Returns a vector iterator of certificate bytes
+        #[diplomat::attr(auto, getter = "server_cert_chain")]
         pub fn get_server_cert_chain(&self) -> Result<Box<CertificateChainIterator>, Box<IronRdpError>> {
             if self.0.server_addr.is_some() {
-                self.0
-                    .x224_connection_pdu
-                    .as_ref()
-                    .ok_or_else(|| Self::missing_field("x224_connection_pdu"))?;
                 let certs = self
                     .0
                     .server_cert_chain
@@ -151,19 +173,14 @@ pub mod ffi {
                 let certs: Vec<Vec<u8>> = certs.iter().map(|cert| cert.as_bytes().to_vec()).collect();
                 Ok(Box::new(CertificateChainIterator { certs, index: 0 }))
             } else {
-                Err(GenericError(anyhow::anyhow!(
-                    "RDCleanPath variant does not contain certificate chain"
-                ))
-                .into())
+                Err(GenericError(anyhow::anyhow!("message variant does not contain certificate chain")).into())
             }
         }
 
         /// Gets the server address string (for Response variant)
-        pub fn get_server_addr<'a>(&'a self, writeable: &'a mut DiplomatWriteable) {
-            if self.0.server_addr.is_some()
-                && self.0.server_cert_chain.is_some()
-                && self.0.x224_connection_pdu.is_some()
-            {
+        #[diplomat::attr(auto, getter = "server_addr")]
+        pub fn get_server_addr<'a>(&'a self, writeable: &'a mut DiplomatWrite) {
+            if self.0.server_addr.is_some() && self.0.server_cert_chain.is_some() {
                 if let Some(server_addr) = &self.0.server_addr {
                     let _ = write!(writeable, "{server_addr}");
                 }
@@ -171,13 +188,15 @@ pub mod ffi {
         }
 
         /// Gets error message (for GeneralError variant)
-        pub fn get_error_message<'a>(&'a self, writeable: &'a mut DiplomatWriteable) {
+        #[diplomat::attr(auto, getter = "error_message")]
+        pub fn get_error_message<'a>(&'a self, writeable: &'a mut DiplomatWrite) {
             if let Ok(err) = self.general_error() {
                 let _ = write!(writeable, "{err}");
             }
         }
 
         /// Gets the error code (for GeneralError variant)
+        #[diplomat::attr(auto, getter = "error_code")]
         pub fn get_error_code(&self) -> Result<u16, Box<IronRdpError>> {
             let err = self.general_error()?;
             Ok(err.error_code)
@@ -185,6 +204,7 @@ pub mod ffi {
 
         /// Gets the HTTP status code if present (for GeneralError variant)
         /// Returns error if not present or not a GeneralError variant
+        #[diplomat::attr(auto, getter = "http_status_code")]
         pub fn get_http_status_code(&self) -> Result<u16, Box<IronRdpError>> {
             let err = self.general_error()?;
 
@@ -193,7 +213,7 @@ pub mod ffi {
         }
 
         fn missing_field(field: &'static str) -> Box<IronRdpError> {
-            GenericError(anyhow::anyhow!("RDCleanPath is missing {field} field")).into()
+            GenericError(anyhow::anyhow!("missing RDCleanPath field: {field}")).into()
         }
 
         fn general_error(&self) -> Result<&ironrdp_rdcleanpath::RDCleanPathErr, Box<IronRdpError>> {
@@ -207,7 +227,7 @@ pub mod ffi {
         }
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, PartialEq, Eq)]
     pub enum RDCleanPathResultType {
         Request,
         Response,
@@ -231,6 +251,7 @@ pub mod ffi {
             matches!(self.0, ironrdp_rdcleanpath::DetectionResult::Failed)
         }
 
+        #[diplomat::attr(auto, getter = "total_length")]
         pub fn get_total_length(&self) -> Result<usize, Box<IronRdpError>> {
             if let ironrdp_rdcleanpath::DetectionResult::Detected { total_length, .. } = self.0 {
                 Ok(total_length)
@@ -240,7 +261,7 @@ pub mod ffi {
         }
     }
 
-    #[diplomat::opaque]
+    #[diplomat::opaque_mut]
     pub struct CertificateChainIterator {
         certs: Vec<Vec<u8>>,
         index: usize,
